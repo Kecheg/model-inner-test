@@ -1,0 +1,19 @@
+#!/bin/bash
+set -ex
+
+# Set environment variables to enable kvcached
+export ENABLE_KVCACHED=true
+export KVCACHED_AUTOPATCH=1
+export VLLM_USE_V1=1
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+
+# Model configuration
+MODEL="meta-llama/Llama-3.2-1B"  # Use smaller model for testing
+PORT=8000
+
+# Start vLLM server
+vllm serve "$MODEL" \
+    --no-enable-prefix-caching \
+    --gpu-memory-utilization 0.5 \
+    --port="$PORT" \
+    --tensor-parallel-size=1

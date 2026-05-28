@@ -18,7 +18,9 @@ model-inner-test/
 │   ├── start-secondary-1gpu.sh         # 单卡 Secondary 启动（参数：端口 显存利用率）
 │   ├── start-primary-pp4.sh            # PP=4 Primary 启动
 │   └── start-secondary-pp4.sh          # PP=4 Secondary 启动
-└── vllm/                               # fxp 修改的源码（覆盖到 site-packages）
+├── vllm/                               # fxp 修改的源码（覆盖到 site-packages）
+├── kvcached/                           # kvcached 完整源码，用于构建/安装 KV pool 能力
+└── sardeenz/                           # Sardeenz 完整源码，用于服务启动和调度
 ```
 
 ## 快速开始
@@ -53,5 +55,15 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
 - Primary 和 Secondary 必须在**同一张物理 GPU**上运行（CUDA IPC 要求）
 - 容器启动需要 `--security-opt seccomp=unconfined`
 - JSON 参数用单引号包裹，变量用 `'"${VAR}"'` 拼接，不要用 `\"` 转义
+- TP2 + 权重复用场景需要容器使用 host PID/IPC namespace，否则 secondary 无法稳定打开 primary 导出的 CUDA IPC handle。
+- kvcached 的 CUDA extension 需要在最终镜像的 torch/CUDA toolchain 下编译；当前 Dockerfile 已复制完整源码到 `/opt/kvcached`，如基础镜像包含匹配编译环境，可启用 Dockerfile 中的 `pip install -e /opt/kvcached`。
+
+## 本次集成内容
+
+- vLLM weight-sharing overlay 保持原有结构。
+- 修复 TP/多卡 secondary 重建 IPC tensor 前未切换 CUDA device 导致的 `cudaErrorInvalidDeviceContext`。
+- 纳入完整 kvcached 源码，保留 Sardeenz 调度侧调用 kvcached autopatch 所需的代码。
+- 纳入完整 Sardeenz 源码，便于后续镜像统一构建服务启动和调度链路。
+- 不包含旧的 vLLM 原生 KV tensor 动态扩缩实验改动，也不包含 `cumem_allocator.cpp` 的 sleep/wake 迁移实验改动。
 
 详细部署步骤见 `docs/DEPLOY-GUIDE.md`。

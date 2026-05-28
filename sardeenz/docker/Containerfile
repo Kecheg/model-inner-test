@@ -1,0 +1,156 @@
+# =============================================================================
+# Multi-stage Dockerfile for Sardeenz
+# Based on vLLM CUDA image (UBI/RHEL) with Node.js 22 and kvcached
+# =============================================================================
+
+# =============================================================================
+# Stage 0: vLLM Base
+# =============================================================================
+FROM quay.io/vllm/vllm-cuda:0.14.1_rhai0 AS vllm-base
+
+USER 0
+
+RUN microdnf -y update \
+    && microdnf clean all \
+    && rm -rf /var/cache/yum/*
+
+# =============================================================================
+# Stage 1: kvcached Builder (vllm-base + CUDA devel + dependencies)
+# =============================================================================
+FROM vllm-base AS kvcached-builder
+
+ARG KVCACHED_VERSION=v0.1.4
+
+ENV NV_CUDA_LIB_VERSION=12.9.0-1
+ENV NV_CUDA_CUDART_DEV_VERSION=12.9.79-1
+ENV NV_NVML_DEV_VERSION=12.9.40-1
+ENV NV_LIBCUBLAS_DEV_VERSION=12.9.0.13-1
+ENV NV_LIBNPP_DEV_VERSION=12.4.0.27-1
+ENV NV_LIBNCCL_PACKAGE=libnccl-2.29.7-1+cuda12.9
+ENV NV_LIBNCCL_DEV_PACKAGE=libnccl-devel-2.29.7-1+cuda12.9
+ENV NV_CUDA_NSIGHT_COMPUTE_VERSION=12.9.0-1
+
+# Install CUDA build dependencies (minimal set for wheel compilation)
+RUN microdnf install -y \
+    git \
+    cuda-command-line-tools-12-9-${NV_CUDA_LIB_VERSION} \
+    cuda-libraries-devel-12-9-${NV_CUDA_LIB_VERSION} \
+    cuda-minimal-build-12-9-${NV_CUDA_LIB_VERSION} \
+    cuda-cudart-devel-12-9-${NV_CUDA_CUDART_DEV_VERSION} \
+    cuda-nvml-devel-12-9-${NV_NVML_DEV_VERSION} \
+    libcublas-devel-12-9-${NV_LIBCUBLAS_DEV_VERSION} \
+    libnpp-devel-12-9-${NV_LIBNPP_DEV_VERSION} \
+    ${NV_LIBNCCL_PACKAGE} \
+    ${NV_LIBNCCL_DEV_PACKAGE} \
+    cuda-nsight-compute-12-9-${NV_CUDA_NSIGHT_COMPUTE_VERSION} \
+    && microdnf clean all \
+    && rm -rf /var/cache/yum/*
+
+# Clone and build kvcached from source (supports branch or tag)
+# LIBRARY_PATH includes CUDA stubs so the linker can find libcuda.so at build time
+WORKDIR /build
+ENV LIBRARY_PATH=/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:${LIBRARY_PATH}}
+RUN git clone --depth 1 --branch ${KVCACHED_VERSION} \
+        https://github.com/ovg-project/kvcached.git \
+    && cd kvcached \
+    && pip3.12 wheel . \
+        --no-build-isolation \
+        --wheel-dir /wheels
+
+# =============================================================================
+# Stage 2: Runtime Dependencies
+# Install Node.js and production dependencies (cached unless package.json changes)
+# =============================================================================
+FROM vllm-base AS runtime-deps
+
+USER 0
+
+# Install Node.js 22 directly (no nvm overhead)
+ENV NODE_VERSION=22.11.0
+RUN microdnf install -y xz \
+    && microdnf clean all \
+    && curl -fsSL https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz \
+    | tar -xJ -C /usr/local --strip-components=1 \
+    && node --version && npm --version
+
+# Copy package files for production install
+WORKDIR /app
+COPY package.json package-lock.json ./
+COPY packages/types/package.json ./packages/types/
+COPY packages/utils/package.json ./packages/utils/
+COPY apps/backend/package.json ./apps/backend/
+COPY apps/frontend/package.json ./apps/frontend/
+
+# Install production dependencies only
+RUN npm ci --omit=dev
+
+# =============================================================================
+# Stage 3: App Builder
+# =============================================================================
+FROM runtime-deps AS builder
+
+# Install dev dependencies on top of production deps
+RUN npm install
+
+# Build packages/types (base dependency)
+COPY packages/types ./packages/types
+COPY tsconfig.base.json ./
+RUN npx tsc -b packages/types
+
+# Build packages/utils (depends on types)
+COPY packages/utils ./packages/utils
+RUN npx tsc -b packages/utils
+
+# Build backend (depends on packages)
+COPY apps/backend ./apps/backend
+RUN npx tsc -b apps/backend
+
+# Build frontend (depends on packages)
+COPY apps/frontend ./apps/frontend
+COPY assets ./assets
+RUN npm run build -w apps/frontend
+
+# =============================================================================
+# Stage 4: Runtime
+# =============================================================================
+FROM runtime-deps AS runtime
+
+# Install Python dependencies from pre-built wheel (kvcached only - vLLM is in base image)
+COPY --from=kvcached-builder /wheels/*.whl /wheels/
+RUN pip install --no-cache-dir /wheels/kvcached*.whl nvitop==1.6.0 \
+    && rm -rf /wheels
+
+# Copy only built packages (dist + package.json, no source)
+COPY --from=builder /app/packages/types/dist ./packages/types/dist
+COPY --from=builder /app/packages/utils/dist ./packages/utils/dist
+
+# Copy backend (dist + migrations + scripts)
+COPY --from=builder /app/apps/backend/dist ./apps/backend/dist
+COPY --from=builder /app/apps/backend/src/db/migrations ./apps/backend/dist/db/migrations
+COPY --from=builder /app/apps/backend/scripts ./apps/backend/scripts
+
+# Copy frontend (static files only)
+COPY --from=builder /app/apps/frontend/dist ./apps/frontend/dist
+
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Environment variables
+ENV NODE_ENV=production
+ENV PORT=3000
+ENV HOST=0.0.0.0
+ENV LOG_LEVEL=info
+ENV ENABLE_KVCACHED=true
+ENV KVCACHED_AUTOPATCH=1
+ENV HF_HUB_OFFLINE=0
+
+# OpenShift arbitrary UID support - redirect cache to writable location
+# vLLM and FlashInfer need writable cache directories; /home/vllm is not writable
+ENV HOME=/opt/app-root/src
+ENV XDG_CACHE_HOME=/opt/app-root/src/.cache
+ENV HF_HOME=/opt/app-root/src/.cache/huggingface
+ENV FLASHINFER_WORKSPACE_DIR=/opt/app-root/src/.cache/flashinfer
+
+EXPOSE 3000
+
+ENTRYPOINT ["/entrypoint.sh"]

@@ -1,0 +1,8 @@
+{
+  "name": "@sardeenz/contracts",
+  "description": "OpenAPI contracts for Sardeenz APIs",
+  "private": true,
+  "files": [
+    "openapi/**/*.yaml"
+  ]
+}

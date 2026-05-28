@@ -1,0 +1,11 @@
+FROM lmsysorg/sglang:v0.5.10
+RUN LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH} pip install kvcached --no-build-isolation
+
+ENV ENABLE_KVCACHED=true
+ENV KVCACHED_AUTOPATCH=1
+ENV KVCACHED_IPC_NAME=SGLANG
+
+EXPOSE 8080 12346 30000 30001
+
+ENTRYPOINT []
+CMD ["bash"]
