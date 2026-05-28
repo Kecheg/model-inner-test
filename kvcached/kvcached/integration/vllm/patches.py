@@ -1397,32 +1397,44 @@ class PoolingModelRunnerPatch(VersionAwarePatch, BasePatch):
     @version_range(VLLM_ALL_RANGE)
     def patch_profile_run(self, GPUModelRunner) -> bool:
         """Patch profile_run to create ActivationPoolManager for pooling models."""
-        if self._is_already_patched(GPUModelRunner.profile_run, "profile_run_pool"):
-            return True
+        # NOTE: no _is_already_patched guard — always overwrite so upgrades
+        # that fix this patch take effect even when an older kvcached version
+        # already patched profile_run.
 
         original_profile = GPUModelRunner.profile_run
         patch_logger = get_kvcached_logger("PoolingModelRunnerPatch")
 
         def _patched_profile(self):
-            mem_before = torch.cuda.memory_allocated()
-            original_profile(self)
-
             is_pooling = getattr(self, "is_pooling_model", False)
             if not is_pooling or not enable_kvcached():
+                original_profile(self)
                 return
             if not is_activation_pool_enabled():
-                patch_logger.debug(
-                    "Activation pool disabled by KVCACHED_ACTIVATION_POOL_ENABLED"
+                patch_logger.info(
+                    "Activation pool disabled by "
+                    "KVCACHED_ACTIVATION_POOL_ENABLED"
                 )
+                original_profile(self)
                 return
 
+            # Reset peak stats so we only measure activation memory
+            # allocated during profile_run, not model loading or other
+            # allocations that happened before.
+            torch.cuda.reset_peak_memory_stats()
+            mem_before = torch.cuda.memory_allocated()
+            original_profile(self)
             mem_peak = torch.cuda.max_memory_allocated()
             activation_bytes = mem_peak - mem_before
+
             if activation_bytes <= 0:
-                patch_logger.warning(
-                    "Zero or negative activation memory delta "
-                    "(%d bytes), skipping activation pool init",
+                patch_logger.info(
+                    "Activation memory delta is %d bytes "
+                    "(mem_before=%d, mem_peak=%d) — "
+                    "skipping activation pool init; "
+                    "activation pool will not be used for this model",
                     activation_bytes,
+                    mem_before,
+                    mem_peak,
                 )
                 return
 
@@ -1451,8 +1463,9 @@ class PoolingModelRunnerPatch(VersionAwarePatch, BasePatch):
     @version_range(VLLM_ALL_RANGE)
     def patch_execute_model(self, GPUModelRunner) -> bool:
         """Patch execute_model to manage activation memory for pooling models."""
-        if self._is_already_patched(GPUModelRunner.execute_model, "execute_model_pool"):
-            return True
+        # NOTE: no _is_already_patched guard — always overwrite so upgrades
+        # that fix this patch take effect even when an older kvcached version
+        # already patched execute_model.
 
         original_execute = GPUModelRunner.execute_model
         patch_logger = get_kvcached_logger("PoolingModelRunnerPatch")
