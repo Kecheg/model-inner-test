@@ -41,6 +41,7 @@ def get_world_size(default: int = 1) -> int:
         )
         return default
 
+
 def init_kvcached(
     tp_rank: int = 0,
     world_size: int = 1,

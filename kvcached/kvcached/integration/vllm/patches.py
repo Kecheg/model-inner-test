@@ -246,11 +246,13 @@ def _is_mla_kv_cache_spec(kv_cache_spec: Any) -> bool:
 def _get_max_cached_blocks(block_size: int) -> int:
     """Derive max cached blocks from the unified MAX_CACHED_TOKENS config.
 
-    Returns 0 (unlimited) when MAX_CACHED_TOKENS is 0.
+    Returns -1 (unlimited) when MAX_CACHED_TOKENS < 0.
+    Returns 0  (disabled — evict on free) when MAX_CACHED_TOKENS == 0.
+    Otherwise returns MAX_CACHED_TOKENS // block_size.
     """
     from kvcached.utils import MAX_CACHED_TOKENS
-    if MAX_CACHED_TOKENS <= 0:
-        return 0
+    if MAX_CACHED_TOKENS < 0:
+        return -1
     return MAX_CACHED_TOKENS // block_size
 
 class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
@@ -300,7 +302,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             ) -> None:
                 assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
                 self.enable_prefix_cache = enable_caching
-                # 0 means unlimited
+                # -1 = unlimited, 0 = disabled (evict on free), >0 = cap
                 self.max_cached_blocks = max_cached_blocks
                 if enable_caching:
                     logger.info("Prefix caching enabled for ElasticBlockPool")
@@ -537,7 +539,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 if uncached_to_free:
                     self.kv_cache_manager.free(uncached_to_free)
 
-                if (self.max_cached_blocks > 0
+                if (self.max_cached_blocks >= 0
                         and len(self._evictable_blocks) > self.max_cached_blocks):
                     excess = len(self._evictable_blocks) - self.max_cached_blocks
                     self._evict_blocks_from_pool(excess)
@@ -1166,11 +1168,44 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             # by kernel-block stride. Forward kernel_block_size so we build the
             # per-layer tensor at kernel granularity.
             kernel_block_sizes = getattr(self, "_kernel_block_sizes", None)
+            has_kernel_block_size_source = kernel_block_sizes is not None
+            if kernel_block_sizes is None:
+                prepare_kernel_block_sizes_method = getattr(
+                    self, "_prepare_kernel_block_sizes", None
+                )
+                if prepare_kernel_block_sizes_method is not None:
+                    has_kernel_block_size_source = True
+                    kernel_block_sizes = prepare_kernel_block_sizes_method(
+                        kv_cache_config
+                    )
+
+            if kernel_block_sizes is None:
+                try:
+                    from vllm.v1.worker.utils import (
+                        prepare_kernel_block_sizes as prepare_kernel_block_sizes_fn,
+                    )
+                except ImportError:
+                    pass
+                else:
+                    attn_groups = getattr(self, "attn_groups", None)
+                    if attn_groups is not None:
+                        has_kernel_block_size_source = True
+                        kernel_block_sizes = prepare_kernel_block_sizes_fn(
+                            kv_cache_config, attn_groups
+                        )
+
             kernel_block_size = (
                 kernel_block_sizes[first_attn_group_id]
                 if kernel_block_sizes is not None
                 and first_attn_group_id < len(kernel_block_sizes)
                 else None)
+            if kernel_block_size is None and has_kernel_block_size_source:
+                raise RuntimeError(
+                    "kvcached could not determine the vLLM kernel block size. "
+                    "This value is required when vLLM splits a virtual KV block "
+                    "into smaller kernel blocks; falling back to block_size can "
+                    "produce invalid KV cache strides."
+                )
 
             alloc_result = kvi.alloc_kv_cache(
                 kv_cache_shape,
