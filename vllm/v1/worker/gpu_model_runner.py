@@ -4584,12 +4584,31 @@ class GPUModelRunner(
             time_after_load - time_before_load,
             scope="local",
         )
+        ws_config = self.vllm_config.weight_sharing_config
+        is_weight_sharing_secondary = (
+            ws_config is not None and ws_config.mode == "secondary"
+        )
         if not load_dummy_weights:
-            prepare_communication_buffer_for_model(self.model)
+            if is_weight_sharing_secondary:
+                logger.info(
+                    "WeightSharing: SECONDARY - skipping post-load "
+                    "communication buffer preparation. The secondary imports "
+                    "already-processed IPC weights, and FP8 MoE modular kernel "
+                    "setup can otherwise re-enter an incompatible legacy "
+                    "prepare path."
+                )
+            else:
+                prepare_communication_buffer_for_model(self.model)
             if (drafter := getattr(self, "drafter", None)) and (
                 drafter_model := getattr(drafter, "model", None)
             ):
-                prepare_communication_buffer_for_model(drafter_model)
+                if is_weight_sharing_secondary:
+                    logger.info(
+                        "WeightSharing: SECONDARY - skipping drafter "
+                        "communication buffer preparation."
+                    )
+                else:
+                    prepare_communication_buffer_for_model(drafter_model)
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())
