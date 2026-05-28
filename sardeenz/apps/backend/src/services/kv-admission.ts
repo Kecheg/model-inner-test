@@ -29,6 +29,8 @@ interface AdmissionResult {
     details?: Record<string, unknown>
   }
   reservation?: ActiveReservation
+  shouldTrimKvcached?: boolean
+  trimReason?: string
 }
 
 type InstanceOverrideMap = Record<string, Partial<InstanceQuota>>
@@ -111,10 +113,14 @@ class KvAdmissionController {
       0.001,
       requestTokens / config.kvAdmissionEstimateTokensPerGiB
     )
+    let trimmedForBackpressure = false
 
     while (true) {
       const result = this.tryAcquire(instance, estimatedGiBPerGpu, requestTokens)
       if (result.allowed) {
+        if (result.shouldTrimKvcached) {
+          await this.trimInstance(instance, result.trimReason ?? 'kv_admission_soft_limit', logger)
+        }
         logger.debug(
           {
             instanceId: instance.id,
@@ -126,6 +132,11 @@ class KvAdmissionController {
           'KV admission allowed request'
         )
         return result
+      }
+
+      if (result.statusCode === 429 && !trimmedForBackpressure) {
+        trimmedForBackpressure = true
+        await this.trimGpuGroup(instance, result.error?.code ?? 'kv_admission_backpressure', logger)
       }
 
       const now = Date.now()
@@ -289,7 +300,13 @@ class KvAdmissionController {
       createdAt: Date.now(),
     }
     this.reservations.set(reservation.id, reservation)
-    return { allowed: true, reservation }
+    return {
+      allowed: true,
+      reservation,
+      shouldTrimKvcached: nextInstanceActive > quota.softLimitGiBPerGpu,
+      trimReason:
+        nextInstanceActive > quota.softLimitGiBPerGpu ? 'kv_admission_soft_limit_exceeded' : undefined,
+    }
   }
 
   private reject(
@@ -362,6 +379,69 @@ class KvAdmissionController {
       protectedMinimum += Math.max(0, quota.minGuaranteeGiBPerGpu - active)
     }
     return protectedMinimum
+  }
+
+  private async trimGpuGroup(instance: ModelInstance, reason: string, logger: Logger): Promise<void> {
+    const gpuGroup = gpuGroupKey(instance)
+    const instances = modelStore
+      .getAll()
+      .filter((sibling) => sibling.status === 'running')
+      .filter((sibling) => sibling.kvcachedEnabled)
+      .filter((sibling) => gpuGroupKey(sibling) === gpuGroup)
+
+    for (const sibling of instances) {
+      await this.trimInstance(sibling, reason, logger)
+    }
+  }
+
+  private async trimInstance(instance: ModelInstance, reason: string, logger: Logger): Promise<void> {
+    if (!instance.kvcachedEnabled || instance.status !== 'running') {
+      return
+    }
+
+    try {
+      const response = await fetch(`http://127.0.0.1:${instance.port}/kvcached/trim`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(2_000),
+      })
+      const payload = await response.json().catch(() => undefined)
+      if (!response.ok) {
+        logger.warn(
+          {
+            instanceId: instance.id,
+            modelName: instance.modelName,
+            port: instance.port,
+            reason,
+            status: response.status,
+            payload,
+          },
+          'KV admission failed to trim kvcached instance'
+        )
+        return
+      }
+
+      logger.info(
+        {
+          instanceId: instance.id,
+          modelName: instance.modelName,
+          port: instance.port,
+          reason,
+          payload,
+        },
+        'KV admission trimmed kvcached instance'
+      )
+    } catch (err) {
+      logger.warn(
+        {
+          instanceId: instance.id,
+          modelName: instance.modelName,
+          port: instance.port,
+          reason,
+          err,
+        },
+        'KV admission failed to call kvcached trim'
+      )
+    }
   }
 
   private quotaFor(instance: ModelInstance): InstanceQuota {
