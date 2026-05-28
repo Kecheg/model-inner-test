@@ -48,6 +48,7 @@ export interface LaunchModelOptions {
   gpuIds?: number[] // Optional explicit GPU selection (auto-selects if not provided)
   topologyGpuIds?: number[]
   tensorParallelSize?: number // For large models spanning multiple GPUs (default: 1)
+  pipelineParallelSize?: number
   placementMode?: 'balanced' | 'concentrated'
   placementGpuId?: number
   sourceType?: 'huggingface' | 'local' // Model source type (default: 'huggingface')
@@ -75,15 +76,32 @@ const FORBIDDEN_ARGS = [
  * - Ensure args start with - or --
  * - Remove system-managed arguments (but allow overridable ones)
  */
+function isForbiddenArg(arg: string): boolean {
+  const argName = arg.split('=')[0].toLowerCase()
+  return FORBIDDEN_ARGS.some((forbidden) => argName === forbidden.toLowerCase())
+}
+
 function sanitizeVllmArgs(args: string[]): string[] {
-  return args
-    .map((arg) => arg.trim())
-    .filter((arg) => arg.length > 0)
-    .filter((arg) => arg.startsWith('-'))
-    .filter((arg) => {
-      const argName = arg.split('=')[0].toLowerCase()
-      return !FORBIDDEN_ARGS.some((forbidden) => argName === forbidden.toLowerCase())
-    })
+  const sanitizedArgs: string[] = []
+  const trimmedArgs = args.map((arg) => arg.trim()).filter((arg) => arg.length > 0)
+
+  for (let i = 0; i < trimmedArgs.length; i++) {
+    const arg = trimmedArgs[i]
+    if (!arg.startsWith('-') || isForbiddenArg(arg)) {
+      continue
+    }
+
+    const nextArg = trimmedArgs[i + 1]
+    if (!arg.includes('=') && nextArg && !nextArg.startsWith('-')) {
+      sanitizedArgs.push(`${arg}=${nextArg}`)
+      i++
+      continue
+    }
+
+    sanitizedArgs.push(arg)
+  }
+
+  return sanitizedArgs
 }
 
 /**
@@ -92,6 +110,25 @@ function sanitizeVllmArgs(args: string[]): string[] {
 function hasArg(args: string[], argName: string): boolean {
   const lowerArgName = argName.toLowerCase()
   return args.some((arg) => arg.split('=')[0].toLowerCase() === lowerArgName)
+}
+
+function hasAnyArg(args: string[], argNames: string[]): boolean {
+  return argNames.some((argName) => hasArg(args, argName))
+}
+
+function getNumericArg(args: string[], argNames: string[]): number | undefined {
+  for (const argName of argNames) {
+    const lowerArgName = argName.toLowerCase()
+    const arg = args.find((candidate) => candidate.split('=')[0].toLowerCase() === lowerArgName)
+    if (!arg || !arg.includes('=')) {
+      continue
+    }
+    const parsed = Number(arg.split('=').slice(1).join('='))
+    if (Number.isFinite(parsed) && parsed > 0) {
+      return Math.floor(parsed)
+    }
+  }
+  return undefined
 }
 
 /**
@@ -209,6 +246,7 @@ export class ModelManager extends EventEmitter {
       gpuIds,
       topologyGpuIds,
       tensorParallelSize = 1,
+      pipelineParallelSize,
       placementMode = 'balanced',
       placementGpuId,
       servedModelName,
@@ -225,6 +263,12 @@ export class ModelManager extends EventEmitter {
 
     // Sanitize user-provided extra arguments
     const sanitizedExtraArgs = sanitizeVllmArgs(extraArgs)
+    const effectivePipelineParallelSize = Math.max(
+      pipelineParallelSize ??
+        getNumericArg(sanitizedExtraArgs, ['--pipeline-parallel-size', '-pp']) ??
+        1,
+      1
+    )
 
     let targetGpuIds: number[]
     let effectiveTopologyGpuIds: number[]
@@ -242,7 +286,7 @@ export class ModelManager extends EventEmitter {
       } else {
         const autoSelection = await this.gpuSelector.getTargetGpus(
           undefined,
-          Math.max(tensorParallelSize, 1)
+          Math.max(tensorParallelSize, 1) * effectivePipelineParallelSize
         )
         effectiveTopologyGpuIds = autoSelection.gpuIds
         wasAutoSelected = autoSelection.wasAutoSelected
@@ -256,9 +300,10 @@ export class ModelManager extends EventEmitter {
       }
 
       effectiveTensorParallelSize = Math.max(tensorParallelSize, 1)
-      if (effectiveTopologyGpuIds.length < effectiveTensorParallelSize) {
+      const requiredExecutionGpuCount = effectiveTensorParallelSize * effectivePipelineParallelSize
+      if (effectiveTopologyGpuIds.length < requiredExecutionGpuCount) {
         throw new InternalError(
-          `placement topology has ${effectiveTopologyGpuIds.length} GPU(s), but tensor_parallel_size=${effectiveTensorParallelSize}`
+          `placement topology has ${effectiveTopologyGpuIds.length} GPU(s), but tensor_parallel_size=${effectiveTensorParallelSize} and pipeline_parallel_size=${effectivePipelineParallelSize} require ${requiredExecutionGpuCount}`
         )
       }
 
@@ -268,12 +313,12 @@ export class ModelManager extends EventEmitter {
         topologyGpuIds && topologyGpuIds.length > 0 ? topologyGpuIds : gpuIds
       const selection = await this.gpuSelector.getTargetGpus(
         requestedExecutionGpuIds,
-        tensorParallelSize
+        Math.max(tensorParallelSize, 1) * effectivePipelineParallelSize
       )
       targetGpuIds = selection.gpuIds
       effectiveTopologyGpuIds = targetGpuIds
       wasAutoSelected = selection.wasAutoSelected
-      effectiveTensorParallelSize = tensorParallelSize
+      effectiveTensorParallelSize = Math.max(tensorParallelSize, 1)
     }
 
     const executionGpuCount = Math.max(targetGpuIds.length, effectiveTensorParallelSize, 1)
@@ -308,6 +353,7 @@ export class ModelManager extends EventEmitter {
         targetGpuIds,
         topologyGpuIds: effectiveTopologyGpuIds,
         tensorParallelSize: effectiveTensorParallelSize,
+        pipelineParallelSize: effectivePipelineParallelSize,
         placementMode,
         placementGpuId: effectivePlacementGpuId,
         enableKvcached,
@@ -407,6 +453,12 @@ export class ModelManager extends EventEmitter {
         }
         if (effectiveTensorParallelSize > 1) {
           baseArgs.push(`--tensor-parallel-size=${effectiveTensorParallelSize}`)
+        }
+        if (
+          effectivePipelineParallelSize > 1 &&
+          !hasAnyArg(sanitizedExtraArgs, ['--pipeline-parallel-size', '-pp'])
+        ) {
+          baseArgs.push(`--pipeline-parallel-size=${effectivePipelineParallelSize}`)
         }
         if (enableKvcached && config.kvcachedDisablePrefixCaching) {
           baseArgs.push('--no-enable-prefix-caching')

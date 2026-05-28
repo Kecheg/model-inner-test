@@ -445,11 +445,20 @@ class WeightSharingManager:
                 serialized)
             func, args = ipc_handle
             list_args = list(args)
-            # index 6 是 torch IPC handle 中的 device_index 位置
+            # index 6 is the CUDA storage device used by PyTorch's
+            # CUDA IPC rebuild path. PyTorch 2.10 still expects an int here.
             list_args[6] = device_index
+            torch.cuda.set_device(device_index)
+            torch.cuda._lazy_init()
+            logger.info(
+                "WeightSharing: rebuild IPC tensor %s on cuda:%d "
+                "(current=%d, visible_devices=%d, storage_device_arg=%r)",
+                name, device_index, torch.cuda.current_device(),
+                torch.cuda.device_count(), list_args[6])
             # ★ 核心：重建 tensor，直接指向 primary 的 GPU 物理内存。
-            # 调用方必须在进入 pre_open_handles 前完成本 rank 的 CUDA
-            # device 绑定，这里只负责按传入 device_index patch IPC args。
+            # 重建 IPC tensor 时必须确保当前 CUDA device 与 handle 的
+            # device_index 一致，否则 secondary 在单卡/TP 场景都可能把
+            # handle 打开到错误上下文。
             return func(*list_args)
         except Exception as exc:
             logger.error(
