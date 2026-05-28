@@ -1,0 +1,143 @@
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index 8891115c1..34099c61e 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -1235,7 +1235,8 @@ class Scheduler(
+             if not self.enable_hierarchical_cache
+             else self.max_total_num_tokens - protected_size
+         )
+-        if memory_leak:
++        enable_kvcached = os.getenv("ENABLE_KVCACHED", "false").lower() == "true"
++        if memory_leak and not enable_kvcached:
+             msg = (
+                 "token_to_kv_pool_allocator memory leak detected! "
+                 f"{available_size=}, {protected_size=}, {self.max_total_num_tokens=}\n"
+diff --git a/python/sglang/srt/mem_cache/memory_pool.py b/python/sglang/srt/mem_cache/memory_pool.py
+index f7eef2120..7c3f5ac7e 100644
+--- a/python/sglang/srt/mem_cache/memory_pool.py
++++ b/python/sglang/srt/mem_cache/memory_pool.py
+@@ -154,14 +154,26 @@ class TokenToKVPoolAllocator:
+         self.clear()
+
+         self._kvcache = kvcache
++        self.enable_kvcached = (
++            hasattr(kvcache, "enable_kvcached") and kvcache.enable_kvcached
++        )
++        if self.enable_kvcached:
++            self.kvcached_allocator = kvcache.kvcached_allocator
+
+     def available_size(self):
++        if self.enable_kvcached:
++            return self.kvcached_allocator.available_size()
+         return len(self.free_slots)
+
+     def get_kvcache(self):
+         return self._kvcache
+
+     def alloc(self, need_size: int):
++        if self.enable_kvcached:
++            indices: List[int] = self.kvcached_allocator.alloc(need_size)
++            indices = torch.tensor(indices, dtype=torch.int32, device="cuda")
++            return indices
++
+         if need_size > len(self.free_slots):
+             return None
+
+@@ -174,6 +186,8 @@ class TokenToKVPoolAllocator:
+             return
+
+         if self.is_not_in_free_group:
++            if self.enable_kvcached:
++                return self.kvcached_allocator.free(free_index.cpu().numpy().tolist())
+             self.free_slots = torch.cat((self.free_slots, free_index))
+         else:
+             self.free_group.append(free_index)
+@@ -194,6 +208,10 @@ class TokenToKVPoolAllocator:
+         self.free_slots = free_slots
+
+     def clear(self):
++        if hasattr(self, "enable_kvcached") and self.enable_kvcached:
++            self.kvcached_allocator.clear()
++            return
++
+         # The padded slot 0 is used for writing dummy outputs from padded tokens.
+         self.free_slots = torch.arange(
+             1, self.size + 1, dtype=torch.int64, device=self.device
+@@ -233,6 +251,31 @@ class MHATokenToKVPool(KVCache):
+         self.head_num = head_num
+         self.head_dim = head_dim
+         self.layer_num = layer_num
++
++        import os
++
++        self.enable_kvcached = os.getenv("ENABLE_KVCACHED", "false").lower() == "true"
++        if self.enable_kvcached:
++            try:
++                import kvcached.integration.sglang.interfaces as kvcached_interfaces
++
++                self.kvcached_interfaces = kvcached_interfaces
++                # TODO: make async_sched/overlap_schedule configurable
++                kvcached_interfaces.init_kvcached(async_sched=True)
++
++                # Initialize KV allocator based on per-token KV size (cell_size)
++                self.cell_size = self.head_num * self.head_dim * self.dtype.itemsize
++                self.kvcached_allocator = kvcached_interfaces.get_kv_cache_manager(
++                    self.size + self.page_size,
++                    self.page_size,
++                    self.cell_size,
++                    num_layers=layer_num,
++                )
++            except ImportError as e:
++                raise ImportError(
++                    "kvcached is not found. Please install it for elastic memory."
++                ) from e
++
+         self._create_buffers()
+         self.start_layer = start_layer or 0
+         self.end_layer = end_layer or layer_num - 1
+@@ -243,11 +286,42 @@ class MHATokenToKVPool(KVCache):
+         self.alt_stream = self.device_module.Stream()
+
+         k_size, v_size = self.get_kv_size_bytes()
+-        logger.info(
+-            f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
+-        )
++        if self.enable_kvcached:
++            total_tokens = self.size + self.page_size
++            elems_per_token = self.head_num * self.head_dim
++            bytes_per_elem = self.dtype.itemsize
++
++            k_size_phy = self.layer_num * total_tokens * elems_per_token * bytes_per_elem
++            v_size_phy = k_size_phy
++
++            logger.info(
++                f"Virtual KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
++            )
++            logger.info(
++                f"Physical KV Cache limits by --mem-fraction-static: #tokens: {size}, K size: {k_size_phy / GB:.2f} GB, V size: {v_size_phy / GB:.2f} GB"
++            )
++        else:
++            logger.info(
++                f"KV Cache is allocated. #tokens: {size}, K size: {k_size / GB:.2f} GB, V size: {v_size / GB:.2f} GB"
++            )
+
+     def _create_buffers(self):
++        if self.enable_kvcached:
++            self.k_buffer, self.v_buffer = self.kvcached_interfaces.alloc_kv_cache(
++                kvcache_shape=(
++                    self.size + self.page_size,
++                    self.head_num,
++                    self.head_dim,
++                ),
++                dtype=self.dtype,
++                device=self.device,
++                num_layers=self.layer_num,
++                page_size=self.page_size,
++                attention_type="MHA",
++                kv_layout="NHD",
++            )
++            return
++
+         with self.memory_saver_adapter.region():
+             # [size, head_num, head_dim] for each layer
+             # The padded slot 0 is used for writing dummy outputs from padded tokens.

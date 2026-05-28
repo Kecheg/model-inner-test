@@ -448,9 +448,10 @@ class WeightSharingManager:
             # index 6 是 torch IPC handle 中的 device_index 位置
             list_args[6] = device_index
             # ★ 核心：重建 tensor，直接指向 primary 的 GPU 物理内存。
-            # 注意：不能在此处调用 torch.cuda.set_device()——
-            # rebuild_cuda_tensor 必须作为新 CUDA context 的第一个操作
-            # 才能成功（cudaIpcOpenMemHandle 限制）。
+            # TP/多卡场景必须先把当前进程切到目标 local device，
+            # 否则 cudaIpcOpenMemHandle 会在默认 device context 下打开
+            # 另一个 GPU 的 handle，触发 cudaErrorInvalidDeviceContext。
+            torch.cuda.set_device(device_index)
             return func(*list_args)
         except Exception as exc:
             logger.error(

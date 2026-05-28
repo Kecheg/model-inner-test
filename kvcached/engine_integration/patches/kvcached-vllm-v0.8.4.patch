@@ -1,0 +1,239 @@
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 74f3f7852..83911ad01 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -279,3 +279,95 @@ class BlockPool:
+             The KV cache usage (between 0.0 and 1.0).
+         """
+         return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
++
++
++class ElasticBlockPool(BlockPool):
++    """ElasticBlockPool that manages KVCacheBlocks.
++    It provides same interface as BlockPool, but it leverages kvcached for
++    elastic KV cachememory management.
++    """
++
++    def __init__(self, num_gpu_blocks: int, block_size: int, cell_size: int,
++                 num_layers: int, enable_caching: bool):
++        assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0
++        assert not enable_caching, (
++            "Caching is not supported in ElasticBlockPool")
++
++        self.num_gpu_blocks = num_gpu_blocks
++
++        from kvcached.integration.vllm.interfaces import (  # noqa: E501
++            get_kv_cache_manager)
++        self.kv_cache_manager = get_kv_cache_manager(num_gpu_blocks,
++                                                     block_size, cell_size,
++                                                     num_layers)
++
++    def get_cached_block(self,
++                         block_hash: BlockHashType) -> Optional[KVCacheBlock]:
++        return None
++
++    def cache_full_blocks(
++        self,
++        request: Request,
++        blocks: list[KVCacheBlock],
++        block_hashes: list[BlockHashType],
++        num_cached_blocks: int,
++        num_full_blocks: int,
++        block_size: int,
++        hash_fn: Callable,
++    ) -> None:
++        raise NotImplementedError(
++            "Caching is not supported in ElasticBlockPool")
++
++    def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
++        """Get new blocks from the free block pool.
++
++        Note that we do not check block cache in this function.
++
++        Args:
++            num_blocks: The number of blocks to allocate.
++
++        Returns:
++            A list of new block.
++        """
++        if num_blocks > self.get_num_free_blocks():
++            raise ValueError(
++                f"Cannot get {num_blocks} free blocks from the pool")
++
++        block_ids = self.kv_cache_manager.alloc(num_blocks)
++        assert len(block_ids) == num_blocks
++
++        return [KVCacheBlock(bid) for bid in block_ids]
++
++    def touch(self, blocks: list[KVCacheBlock]) -> None:
++        raise NotImplementedError("Not supported in ElasticBlockPool")
++
++    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
++        """Free a list of blocks. The blocks should be ordered by their
++        eviction priority, where the first block will be evicted first.
++
++        Args:
++            ordered_blocks: A list of blocks to free ordered by their eviction
++                priority.
++        """
++        block_ids = [block.block_id for block in ordered_blocks]
++        if len(block_ids) > 0:
++            self.kv_cache_manager.free(block_ids)
++
++    def reset_prefix_cache(self) -> bool:
++        raise NotImplementedError("Not supported in ElasticBlockPool")
++
++    def get_num_free_blocks(self) -> int:
++        """Get the number of free blocks in the pool.
++
++        Returns:
++            The number of free blocks.
++        """
++        return self.kv_cache_manager.available_size()
++
++    def get_usage(self) -> float:
++        """Get the KV cache usage.
++
++        Returns:
++            The KV cache usage (between 0.0 and 1.0).
++        """
++        return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)
+diff --git a/vllm/v1/core/kv_cache_manager.py b/vllm/v1/core/kv_cache_manager.py
+index 33761cf7f..d10145bc8 100644
+--- a/vllm/v1/core/kv_cache_manager.py
++++ b/vllm/v1/core/kv_cache_manager.py
+@@ -55,7 +55,26 @@ class KVCacheManager:
+         self.num_preallocate_blocks = cdiv(num_preallocate_tokens,
+                                            self.block_size)
+
+-        self.block_pool = BlockPool(self.num_gpu_blocks, enable_caching)
++        import os  # noqa: E501
++
++        self.enable_kvcached = os.getenv("ENABLE_KVCACHED",
++                                         "false").lower() == "true"
++
++        self.block_pool: BlockPool
++        if self.enable_kvcached:
++            from vllm.v1.core.block_pool import ElasticBlockPool  # noqa: E501
++            if self.enable_caching:
++                raise ValueError("Caching is not supported for kvcached")
++            # cell_size is the size of the k/v cache tensor for a single token.
++            cell_size = kv_cache_spec.page_size_bytes // self.block_size // 2
++            self.block_pool = ElasticBlockPool(self.num_gpu_blocks,
++                                               self.block_size,
++                                               cell_size=cell_size,
++                                               num_layers=len(
++                                                   kv_cache_config.tensors),
++                                               enable_caching=enable_caching)
++        else:
++            self.block_pool = BlockPool(self.num_gpu_blocks, enable_caching)
+
+         self.specialized_manager = get_specialized_manager(
+             kv_cache_spec=kv_cache_spec,
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index f642e5100..923e2ee04 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -73,6 +73,16 @@ class EngineCore:
+         vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
+         vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
+
++        enable_kvcached = os.getenv("ENABLE_KVCACHED",
++                                    "false").lower() == "true"
++        if enable_kvcached:
++            from kvcached.integration.vllm.interfaces import init_kvcached
++            init_kvcached(
++                tp_rank=0,
++                tp_size=vllm_config.parallel_config.tensor_parallel_size,
++                is_worker=False,
++            )
++
+         self.structured_output_manager = StructuredOutputManager(vllm_config)
+
+         # Setup scheduler.
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 70e8bd75e..022c9d150 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -272,6 +272,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                                         pin_memory=self.pin_memory)
+         self.seq_lens_np = self.seq_lens_cpu.numpy()
+
++        import os
++        self.enable_kvcached = os.getenv("ENABLE_KVCACHED",
++                                         "false").lower() == "true"
++
++        if self.enable_kvcached:
++            import kvcached.integration.vllm.interfaces as kvcached_interfaces
++            self.kvcached_interfaces = kvcached_interfaces
++            # Get tensor parallel rank and size from vLLM's parallel state
++            from vllm.distributed.parallel_state import (
++                get_tensor_model_parallel_rank,
++                get_tensor_model_parallel_world_size)
++            tp_rank = get_tensor_model_parallel_rank()
++            tp_size = get_tensor_model_parallel_world_size()
++            kvcached_interfaces.init_kvcached(tp_rank=tp_rank,
++                                              tp_size=tp_size,
++                                              is_worker=True,
++                                              device=str(self.device))
++
+     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+         """Update the cached states and the persistent batch with the scheduler
+         output.
+@@ -1640,6 +1658,56 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+
+         kv_caches: dict[str, torch.Tensor] = {}
+
++        if self.enable_kvcached:
++            for kv_cache_group in kv_cache_config.kv_cache_groups:
++                kv_cache_spec = kv_cache_group.kv_cache_spec
++                for layer_name in kv_cache_group.layer_names:
++                    if not isinstance(kv_cache_spec, FullAttentionSpec):
++                        raise ValueError(
++                            "kvcached only supports full attention")
++                    tensor_config = kv_cache_config.tensors[layer_name]
++                    assert (tensor_config.size %
++                            kv_cache_spec.page_size_bytes == 0)
++                    num_blocks = (tensor_config.size //
++                                  kv_cache_spec.page_size_bytes)
++                    assert num_blocks >= kv_cache_config.num_blocks
++
++            num_layers = len(kv_cache_config.tensors)
++            layer_name = list(kv_cache_config.tensors.keys())[0]
++            kv_cache_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
++            tensor_config = kv_cache_config.tensors[layer_name]
++
++            # kv_cache_spec is guaranteed to be FullAttentionSpec
++            # due to the check above
++            assert isinstance(kv_cache_spec, FullAttentionSpec)
++            dtype = kv_cache_spec.dtype
++            num_blocks = tensor_config.size // kv_cache_spec.page_size_bytes
++            assert num_blocks >= kv_cache_config.num_blocks
++            kv_cache_shape = self.attn_backend.get_kv_cache_shape(
++                num_blocks, kv_cache_spec.block_size,
++                kv_cache_spec.num_kv_heads, kv_cache_spec.head_size)
++
++            kv_cache_buffers = self.kvcached_interfaces.alloc_kv_cache(
++                kv_cache_shape,
++                kv_cache_spec.block_size,
++                dtype,
++                self.device.type,
++                num_layers,
++                attention_type="MHA",
++                kv_layout="NHD",
++            )
++            layer_id = 0
++            for kv_cache_group in kv_cache_config.kv_cache_groups:
++                for layer_name in kv_cache_group.layer_names:
++                    kv_caches[layer_name] = kv_cache_buffers[layer_id]
++                    layer_id += 1
++
++            bind_kv_cache(
++                kv_caches,
++                self.vllm_config.compilation_config.static_forward_context,
++                self.kv_caches)
++            return
++
+         for kv_cache_group in kv_cache_config.kv_cache_groups:
+             kv_cache_spec = kv_cache_group.kv_cache_spec
+             for layer_name in kv_cache_group.layer_names:

@@ -1,0 +1,1033 @@
+import type { FastifyInstance } from 'fastify'
+import { Type } from '@sinclair/typebox'
+import {
+  LoadModelRequestSchema,
+  LoadModelResponseSchema,
+  UnloadModelResponseSchema,
+  ListModelsResponseSchema,
+  GetModelResponseSchema,
+  ModelHealthResponseSchema,
+  ErrorResponseSchema,
+  ListInstancesResponseSchema,
+  UnloadInstanceResponseSchema,
+  SleepModelRequestSchema,
+  SleepModelResponseSchema,
+  WakeModelRequestSchema,
+  WakeModelResponseSchema,
+  SleepStatusResponseSchema,
+  ActivateModelInstanceRequestSchema,
+  ActivateModelInstanceResponseSchema,
+  MoveModelRequestSchema,
+  type LoadModelRequestType,
+  type SleepModelRequestType,
+  type WakeModelRequestType,
+  type ActivateModelInstanceRequestType,
+  type MoveModelRequestType,
+} from '@sardeenz/types'
+import { getModelManager } from '../services/model-manager.js'
+import { getModelMover } from '../services/model-mover.js'
+import { getClusterManager } from '../services/cluster-manager.js'
+import { modelStore } from '../stores/model-store.js'
+import { peerStore } from '../stores/peer-store.js'
+import { operationStore } from '../stores/operation-store.js'
+import { NotFoundError, AppError } from '../utils/errors.js'
+import { randomUUID } from 'crypto'
+import type { ControllerOperation, ModelInstanceDTO } from '@sardeenz/types'
+import { OperationStatus, OperationType } from '@sardeenz/types'
+import { toModelDTO as toDTO } from '../utils/model-dto.js'
+
+export default async function modelsRoutes(fastify: FastifyInstance) {
+  const modelManager = getModelManager(fastify.log)
+
+  /**
+   * POST /api/models/load - Load a new model
+   */
+  fastify.post<{ Body: LoadModelRequestType }>(
+    '/api/models/load',
+    {
+      schema: {
+        tags: ['models'],
+        description: 'Load a new model instance',
+        body: LoadModelRequestSchema,
+        response: {
+          200: LoadModelResponseSchema,
+          409: ErrorResponseSchema,
+          500: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin'),
+    },
+    async (request, reply) => {
+      const {
+        model_path,
+        max_tokens,
+        extra_args,
+        gpu_memory_utilization,
+        kv_cache_memory_bytes,
+        resource_budget_gpu_count,
+        enforce_eager,
+        routable,
+        gpu_ids,
+        topology_gpu_ids,
+        tensor_parallel_size,
+        placement_mode,
+        placement_gpu_id,
+        source_type,
+        served_model_name,
+        enable_sleep_mode,
+        idle_sleep_timeout_seconds,
+        idle_sleep_level,
+        auto_wake_on_request,
+        load_conflict_policy,
+        load_conflict_idle_threshold_seconds,
+      } = request.body
+
+      const operationId = randomUUID()
+      const operation: ControllerOperation = {
+        id: operationId,
+        operationType: OperationType.Load,
+        modelPath: model_path,
+        initiatedBy: 'system', // TODO: Get from auth context
+        initiatedAt: new Date(),
+        status: OperationStatus.InProgress,
+        parameters: {
+          max_tokens,
+          extra_args,
+          gpu_ids,
+          tensor_parallel_size,
+          source_type,
+          served_model_name,
+        },
+      }
+
+      operationStore.add(operation)
+
+      const timer = fastify.sardeenzMetrics.modelLoadDuration.startTimer()
+
+      try {
+        // launchModel now returns immediately with status='starting'
+        // Model loading continues in background, frontend subscribes via SSE
+        const instance = await modelManager.launchModel({
+          modelPath: model_path,
+          maxTokens: max_tokens,
+          extraArgs: extra_args,
+          gpuMemoryUtilization: gpu_memory_utilization,
+          resourceBudgetGpuCount: resource_budget_gpu_count,
+          kvCacheMemoryBytes: kv_cache_memory_bytes,
+          enforceEager: enforce_eager,
+          routable,
+          gpuIds: gpu_ids,
+          topologyGpuIds: topology_gpu_ids,
+          tensorParallelSize: tensor_parallel_size,
+          placementMode: placement_mode,
+          placementGpuId: placement_gpu_id,
+          sourceType: source_type,
+          servedModelName: served_model_name,
+          enableSleepMode: enable_sleep_mode,
+          idleSleepTimeoutSeconds: idle_sleep_timeout_seconds,
+          idleSleepLevel: idle_sleep_level,
+          autoWakeOnRequest: auto_wake_on_request,
+          loadConflictPolicy: load_conflict_policy,
+          loadConflictIdleThresholdSeconds: load_conflict_idle_threshold_seconds,
+        })
+
+        // Operation stays InProgress - will be updated when model finishes loading
+        // Frontend can track progress via SSE events on /api/models/instances/:id/events
+        fastify.sardeenzMetrics.activeModels.set(modelStore.count())
+
+        return {
+          status: 'success' as const,
+          model: instance.modelPath,
+          port: instance.port,
+          loaded_at: instance.loadedAt.toISOString(),
+          instance_id: instance.id,
+        }
+      } catch (err) {
+        // This only catches spawn failures, not loading failures
+        // Loading failures are emitted via SSE events
+        operation.status = OperationStatus.Failed
+        operation.completedAt = new Date()
+        operation.errorMessage = err instanceof Error ? err.message : 'Unknown error'
+        operation.durationSeconds =
+          (operation.completedAt.getTime() - operation.initiatedAt.getTime()) / 1000
+        operationStore.add(operation)
+
+        timer({ model_path, status: 'failure' })
+
+        if (err instanceof AppError) {
+          return reply.code(err.statusCode).send(err.toJSON())
+        }
+
+        return reply.code(500).send({
+          error: {
+            message: err instanceof Error ? err.message : 'Unknown error',
+            type: 'internal_error',
+          },
+        })
+      }
+    }
+  )
+
+  /**
+   * DELETE /api/models/:model_path - Unload a model
+   */
+  fastify.delete<{ Params: { model_path: string } }>(
+    '/api/models/:model_path',
+    {
+      schema: {
+        tags: ['models'],
+        description: 'Unload a model instance',
+        params: Type.Object({
+          model_path: Type.String(),
+        }),
+        response: {
+          200: UnloadModelResponseSchema,
+          404: ErrorResponseSchema,
+          500: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin'),
+    },
+    async (request, reply) => {
+      const { model_path } = request.params
+      const decodedPath = decodeURIComponent(model_path)
+
+      const operationId = randomUUID()
+      const operation: ControllerOperation = {
+        id: operationId,
+        operationType: OperationType.Unload,
+        modelPath: decodedPath,
+        initiatedBy: 'system', // TODO: Get from auth context
+        initiatedAt: new Date(),
+        status: OperationStatus.InProgress,
+      }
+
+      operationStore.add(operation)
+
+      const timer = fastify.sardeenzMetrics.modelUnloadDuration.startTimer()
+
+      try {
+        await modelManager.unloadModel(decodedPath)
+
+        operation.status = OperationStatus.Completed
+        operation.completedAt = new Date()
+        operation.durationSeconds =
+          (operation.completedAt.getTime() - operation.initiatedAt.getTime()) / 1000
+        operationStore.add(operation)
+
+        timer({ model_path: decodedPath })
+        fastify.sardeenzMetrics.activeModels.set(modelStore.count())
+
+        return {
+          status: 'success' as const,
+          model: decodedPath,
+          unloaded_at: new Date().toISOString(),
+        }
+      } catch (err) {
+        operation.status = OperationStatus.Failed
+        operation.completedAt = new Date()
+        operation.errorMessage = err instanceof Error ? err.message : 'Unknown error'
+        operation.durationSeconds =
+          (operation.completedAt.getTime() - operation.initiatedAt.getTime()) / 1000
+        operationStore.add(operation)
+
+        if (err instanceof AppError) {
+          return reply.code(err.statusCode).send(err.toJSON())
+        }
+
+        return reply.code(500).send({
+          error: {
+            message: err instanceof Error ? err.message : 'Unknown error',
+            type: 'internal_error',
+          },
+        })
+      }
+    }
+  )
+
+  /**
+   * GET /api/models - List models
+   * ?scope=cluster  → all pods (chatbot playground)
+   * (default)       → local pod only (Model Management, benchmarks, etc.)
+   */
+  fastify.get<{ Querystring: { scope?: string } }>(
+    '/api/models',
+    {
+      schema: {
+        tags: ['models'],
+        description: 'List loaded models. Use ?scope=cluster to include all cluster pods.',
+        querystring: Type.Object({
+          scope: Type.Optional(Type.String()),
+        }),
+        response: {
+          200: ListModelsResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin-readonly'),
+      config: { logRequests: false },
+    },
+    async (request) => {
+      const clusterManager = getClusterManager(fastify.log)
+      const clusterScope = request.query.scope === 'cluster'
+
+      if (!clusterScope || !clusterManager.isClusterMode()) {
+        // Local-only: original behavior used by Model Management, benchmarks, etc.
+        const instances = modelManager.listModels()
+        if (clusterManager.isClusterMode()) {
+          const localPodId = clusterManager.getPodId()
+          return {
+            models: instances.map((inst) => ({ ...toDTO(inst), pod_id: localPodId })),
+            total: instances.length,
+          }
+        }
+        return { models: instances.map(toDTO), total: instances.length }
+      }
+
+      // Cluster scope: aggregate from all healthy peers
+      const localPodId = clusterManager.getPodId()
+      const localModels: ModelInstanceDTO[] = modelManager.listModels().map((inst) => ({
+        ...toDTO(inst),
+        pod_id: localPodId,
+      }))
+      const seenIds = new Set<string>(localModels.map((m) => m.id))
+
+      const remoteModels: ModelInstanceDTO[] = []
+      for (const peer of peerStore.getHealthyPeers()) {
+        if (peer.podId === localPodId) continue
+        for (const entry of peer.models) {
+          if (seenIds.has(entry.instanceId)) continue
+          seenIds.add(entry.instanceId)
+          remoteModels.push({
+            id: entry.instanceId,
+            model_path: entry.modelPath,
+            model_name: entry.modelName,
+            status: entry.status,
+            port: entry.port,
+            process_id: -1,
+            max_tokens: entry.maxTokens,
+            gpu_memory_utilization: 0,
+            loaded_at: new Date(peer.lastHeartbeat).toISOString(),
+            gpu_ids: entry.gpuIds,
+            tensor_parallel_size: entry.tensorParallelSize,
+            kvcached_enabled: false,
+            sleep_mode_enabled: false,
+            auto_wake_on_request: false,
+            pod_id: peer.podId,
+          })
+        }
+      }
+
+      const allModels = [...localModels, ...remoteModels]
+      return { models: allModels, total: allModels.length }
+    }
+  )
+
+  /**
+   * GET /api/models/:model_path - Get model details
+   */
+  fastify.get<{ Params: { model_path: string } }>(
+    '/api/models/:model_path',
+    {
+      schema: {
+        tags: ['models'],
+        description: 'Get details of a specific model',
+        params: Type.Object({
+          model_path: Type.String(),
+        }),
+        response: {
+          200: GetModelResponseSchema,
+          404: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin-readonly'),
+    },
+    async (request) => {
+      const { model_path } = request.params
+      const decodedPath = decodeURIComponent(model_path)
+
+      const instance = modelManager.getModelStatus(decodedPath)
+      if (!instance) {
+        throw new NotFoundError(`Model ${decodedPath} not found`)
+      }
+
+      return {
+        model: toDTO(instance),
+      }
+    }
+  )
+
+  /**
+   * GET /api/models/:model_path/health - Check model health
+   */
+  fastify.get<{ Params: { model_path: string } }>(
+    '/api/models/:model_path/health',
+    {
+      schema: {
+        tags: ['models'],
+        description: 'Check health of a specific model',
+        params: Type.Object({
+          model_path: Type.String(),
+        }),
+        response: {
+          200: ModelHealthResponseSchema,
+          404: ErrorResponseSchema,
+          503: ModelHealthResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      const { model_path } = request.params
+      const decodedPath = decodeURIComponent(model_path)
+
+      const instance = modelManager.getModelStatus(decodedPath)
+      if (!instance) {
+        throw new NotFoundError(`Model ${decodedPath} not found`)
+      }
+
+      if (instance.status !== 'running') {
+        return reply.code(503).send({
+          status: 'unhealthy',
+          model: decodedPath,
+          port: instance.port,
+          uptime_seconds: 0,
+        })
+      }
+
+      try {
+        // Check if vLLM health endpoint responds
+        const response = await fetch(`http://localhost:${instance.port}/health`, {
+          signal: AbortSignal.timeout(2000),
+        })
+
+        if (!response.ok) {
+          return reply.code(503).send({
+            status: 'unhealthy',
+            model: decodedPath,
+            port: instance.port,
+            uptime_seconds: instance.readyAt ? (Date.now() - instance.readyAt.getTime()) / 1000 : 0,
+          })
+        }
+
+        return {
+          status: 'healthy' as const,
+          model: decodedPath,
+          port: instance.port,
+          uptime_seconds: instance.readyAt ? (Date.now() - instance.readyAt.getTime()) / 1000 : 0,
+        }
+      } catch {
+        return reply.code(503).send({
+          status: 'unhealthy',
+          model: decodedPath,
+          port: instance.port,
+          uptime_seconds: 0,
+        })
+      }
+    }
+  )
+
+  /**
+   * GET /api/models/:model_path/instances - List all instances for a model path (FR-004)
+   */
+  fastify.get<{ Params: { model_path: string } }>(
+    '/api/models/:model_path/instances',
+    {
+      schema: {
+        tags: ['models'],
+        description: 'List all instances of a specific model (FR-004 multi-instance support)',
+        params: Type.Object({
+          model_path: Type.String(),
+        }),
+        response: {
+          200: ListInstancesResponseSchema,
+          404: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin-readonly'),
+    },
+    async (request) => {
+      const { model_path } = request.params
+      const decodedPath = decodeURIComponent(model_path)
+
+      const instances = modelManager.getInstancesByPath(decodedPath)
+      if (instances.length === 0) {
+        throw new NotFoundError(`No instances found for model ${decodedPath}`)
+      }
+
+      return {
+        instances: instances.map(toDTO),
+        total: instances.length,
+      }
+    }
+  )
+
+  /**
+   * DELETE /api/models/instances/:instance_id - Unload by instance ID (FR-004)
+   */
+  fastify.delete<{ Params: { instance_id: string } }>(
+    '/api/models/instances/:instance_id',
+    {
+      schema: {
+        tags: ['models'],
+        description: 'Unload a specific model instance by ID (FR-004 multi-instance support)',
+        params: Type.Object({
+          instance_id: Type.String({ format: 'uuid' }),
+        }),
+        response: {
+          200: UnloadInstanceResponseSchema,
+          404: ErrorResponseSchema,
+          500: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin'),
+    },
+    async (request, reply) => {
+      const { instance_id } = request.params
+
+      // Get instance info before unloading
+      const instance = modelManager.getModelStatus(instance_id)
+      if (!instance) {
+        throw new NotFoundError(`Model instance ${instance_id} not found`)
+      }
+
+      const modelPath = instance.modelPath
+
+      const operationId = randomUUID()
+      const operation: ControllerOperation = {
+        id: operationId,
+        operationType: OperationType.Unload,
+        modelPath,
+        initiatedBy: 'system', // TODO: Get from auth context
+        initiatedAt: new Date(),
+        status: OperationStatus.InProgress,
+      }
+
+      operationStore.add(operation)
+
+      try {
+        await modelManager.unloadModel(instance_id)
+
+        operation.status = OperationStatus.Completed
+        operation.completedAt = new Date()
+        operation.durationSeconds =
+          (operation.completedAt.getTime() - operation.initiatedAt.getTime()) / 1000
+        operationStore.add(operation)
+
+        return {
+          status: 'success' as const,
+          instance_id,
+          model_path: modelPath,
+          unloaded_at: new Date().toISOString(),
+        }
+      } catch (err) {
+        operation.status = OperationStatus.Failed
+        operation.completedAt = new Date()
+        operation.errorMessage = err instanceof Error ? err.message : 'Unknown error'
+        operation.durationSeconds =
+          (operation.completedAt.getTime() - operation.initiatedAt.getTime()) / 1000
+        operationStore.add(operation)
+
+        if (err instanceof AppError) {
+          return reply.code(err.statusCode).send(err.toJSON())
+        }
+
+        return reply.code(500).send({
+          error: {
+            message: err instanceof Error ? err.message : 'Unknown error',
+            type: 'internal_error',
+          },
+        })
+      }
+    }
+  )
+
+  /**
+   * GET /api/models/instances/:instance_id/logs - Get process logs for an instance
+   * Useful for debugging model loading failures
+   */
+  fastify.get<{ Params: { instance_id: string }; Querystring: { lines?: number } }>(
+    '/api/models/instances/:instance_id/logs',
+    {
+      schema: {
+        tags: ['models'],
+        description: 'Get buffered process logs for a model instance (useful for debugging)',
+        params: Type.Object({
+          instance_id: Type.String({ format: 'uuid' }),
+        }),
+        querystring: Type.Object({
+          lines: Type.Optional(Type.Number({ minimum: 1, maximum: 500, default: 100 })),
+        }),
+        response: {
+          200: Type.Object({
+            instance_id: Type.String(),
+            logs: Type.String(),
+            line_count: Type.Number(),
+          }),
+          404: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin-readonly'),
+    },
+    async (request) => {
+      const { instance_id } = request.params
+
+      // Check if instance exists (or has logs from a failed instance)
+      const instance = modelManager.getModelStatus(instance_id)
+      const { logs, lineCount } = modelManager.getLogs(instance_id)
+
+      if (!instance && lineCount === 0) {
+        throw new NotFoundError(`No logs found for instance ${instance_id}`)
+      }
+
+      return {
+        instance_id,
+        logs,
+        line_count: lineCount,
+      }
+    }
+  )
+
+  /**
+   * POST /api/models/instances/:instance_id/sleep - Put model to sleep
+   */
+  fastify.post<{
+    Params: { instance_id: string }
+    Body: SleepModelRequestType
+  }>(
+    '/api/models/instances/:instance_id/sleep',
+    {
+      schema: {
+        tags: ['models'],
+        summary: 'Put model instance to sleep',
+        params: Type.Object({ instance_id: Type.String({ format: 'uuid' }) }),
+        body: SleepModelRequestSchema,
+        response: {
+          200: SleepModelResponseSchema,
+          400: ErrorResponseSchema,
+          404: ErrorResponseSchema,
+          409: ErrorResponseSchema,
+          500: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin'),
+    },
+    async (request, reply) => {
+      const { instance_id } = request.params
+      const { level = 1 } = request.body ?? {}
+
+      try {
+        await modelManager.sleepModel(instance_id, level)
+
+        const instance = modelStore.get(instance_id)
+        if (!instance) {
+          return reply.status(404).send({
+            error: {
+              message: `Model instance ${instance_id} not found`,
+              type: 'not_found',
+              code: 'MODEL_NOT_FOUND',
+            },
+          })
+        }
+
+        return reply.send({
+          status: 'success' as const,
+          instance_id,
+          model_path: instance.modelPath,
+          sleep_level: level,
+          message: `Model instance ${instance_id} entered sleep level ${level}`,
+          slept_at: instance.sleptAt?.toISOString() ?? new Date().toISOString(),
+        })
+      } catch (err) {
+        if (err instanceof NotFoundError) {
+          return reply.status(404).send({
+            error: {
+              message: err.message,
+              type: 'not_found',
+              code: 'MODEL_NOT_FOUND',
+            },
+          })
+        }
+        if (err instanceof AppError) {
+          const statusCode = err.message.includes('not loaded with sleep mode') ? 400 : 409
+          return reply.status(statusCode).send({
+            error: {
+              message: err.message,
+              type: statusCode === 400 ? 'bad_request' : 'conflict',
+              code: statusCode === 400 ? 'INVALID_SLEEP_REQUEST' : 'SLEEP_CONFLICT',
+            },
+          })
+        }
+        return reply.status(500).send({
+          error: {
+            message: err instanceof Error ? err.message : 'Unknown error',
+            type: 'internal_error',
+            code: 'INTERNAL_ERROR',
+          },
+        })
+      }
+    }
+  )
+
+  /**
+   * POST /api/models/instances/:instance_id/wake - Wake sleeping model
+   */
+  fastify.post<{
+    Params: { instance_id: string }
+    Body: WakeModelRequestType
+  }>(
+    '/api/models/instances/:instance_id/wake',
+    {
+      schema: {
+        tags: ['models'],
+        summary: 'Wake a sleeping model instance',
+        params: Type.Object({ instance_id: Type.String({ format: 'uuid' }) }),
+        body: WakeModelRequestSchema,
+        response: {
+          200: WakeModelResponseSchema,
+          404: ErrorResponseSchema,
+          409: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin'),
+    },
+    async (request, reply) => {
+      const { instance_id } = request.params
+      const { tags, placement_mode, placement_gpu_id } = request.body ?? {}
+
+      try {
+        await modelManager.wakeModel(instance_id, {
+          tags,
+          placementMode: placement_mode,
+          placementGpuId: placement_gpu_id,
+        })
+
+        const instance = modelStore.get(instance_id)
+        if (!instance) {
+          return reply.status(404).send({
+            error: {
+              message: `Model instance ${instance_id} not found`,
+              type: 'not_found',
+              code: 'MODEL_NOT_FOUND',
+            },
+          })
+        }
+
+        return reply.send({
+          status: 'success' as const,
+          instance_id,
+          model_path: instance.modelPath,
+          message: `Model instance ${instance_id} woke successfully`,
+          woke_at: new Date().toISOString(),
+        })
+      } catch (err) {
+        if (err instanceof NotFoundError) {
+          return reply.status(404).send({
+            error: {
+              message: err.message,
+              type: 'not_found',
+              code: 'MODEL_NOT_FOUND',
+            },
+          })
+        }
+        if (err instanceof AppError) {
+          return reply.status(409).send({
+            error: {
+              message: err.message,
+              type: 'conflict',
+              code: 'WAKE_CONFLICT',
+            },
+          })
+        }
+        return reply.status(500).send({
+          error: {
+            message: err instanceof Error ? err.message : 'Unknown error',
+            type: 'internal_error',
+          },
+        })
+      }
+    }
+  )
+
+  /**
+   * POST /api/models/instances/:instance_id/activate - Make one instance active and siblings standby
+   */
+  fastify.post<{
+    Params: { instance_id: string }
+    Body: ActivateModelInstanceRequestType
+  }>(
+    '/api/models/instances/:instance_id/activate',
+    {
+      schema: {
+        tags: ['models'],
+        summary: 'Activate one instance for routing and move same-name siblings to standby',
+        params: Type.Object({ instance_id: Type.String({ format: 'uuid' }) }),
+        body: ActivateModelInstanceRequestSchema,
+        response: {
+          200: ActivateModelInstanceResponseSchema,
+          404: ErrorResponseSchema,
+          409: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin'),
+    },
+    async (request, reply) => {
+      const { instance_id } = request.params
+      const {
+        sleep_other_instances = true,
+        sleep_level = 1,
+        wait_for_drain_s = 30,
+      } = request.body ?? {}
+
+      try {
+        const result = await modelManager.activateInstance(instance_id, {
+          sleepOtherInstances: sleep_other_instances,
+          sleepLevel: sleep_level,
+          waitForDrainSeconds: wait_for_drain_s,
+        })
+
+        return reply.send({
+          status: 'success' as const,
+          active_instance_id: instance_id,
+          model_name: result.modelName,
+          standby_instance_ids: result.standbyInstanceIds,
+          slept_instance_ids: result.sleptInstanceIds,
+          woke_target: result.wokeTarget,
+          switched_at: new Date().toISOString(),
+        })
+      } catch (err) {
+        if (err instanceof NotFoundError) {
+          return reply.status(404).send({
+            error: 'Not Found',
+            message: err.message,
+          })
+        }
+        if (err instanceof AppError) {
+          return reply.status(409).send({
+            error: 'Conflict',
+            message: err.message,
+          })
+        }
+        throw err
+      }
+    }
+  )
+
+  /**
+   * GET /api/models/instances/:instance_id/sleep-status - Check sleep status
+   */
+  fastify.get<{ Params: { instance_id: string } }>(
+    '/api/models/instances/:instance_id/sleep-status',
+    {
+      schema: {
+        tags: ['models'],
+        summary: 'Check if model instance is sleeping',
+        params: Type.Object({ instance_id: Type.String({ format: 'uuid' }) }),
+        response: {
+          200: SleepStatusResponseSchema,
+          404: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin-readonly'),
+    },
+    async (request, reply) => {
+      const { instance_id } = request.params
+
+      try {
+        const sleepStatus = await modelManager.isSleeping(instance_id)
+
+        return reply.send({
+          instance_id,
+          is_sleeping: sleepStatus.isSleeping,
+          sleep_level: sleepStatus.level,
+        })
+      } catch (err) {
+        if (err instanceof NotFoundError) {
+          return reply.status(404).send({
+            error: 'Not Found',
+            message: err.message,
+          })
+        }
+        throw err
+      }
+    }
+  )
+
+  /**
+   * POST /api/models/instances/:instance_id/move - Move model to different GPU(s)
+   */
+  fastify.post<{
+    Params: { instance_id: string }
+    Body: MoveModelRequestType
+  }>(
+    '/api/models/instances/:instance_id/move',
+    {
+      schema: {
+        tags: ['models'],
+        summary: 'Move model instance to different GPU(s)',
+        description:
+          'Initiates a blue-green move operation to relocate a model to different GPU(s). Returns immediately with a move ID for SSE tracking.',
+        params: Type.Object({ instance_id: Type.String({ format: 'uuid' }) }),
+        body: MoveModelRequestSchema,
+        response: {
+          202: Type.Object({
+            move_id: Type.String(),
+            source_instance_id: Type.String(),
+            target_gpu_ids: Type.Array(Type.Number()),
+          }),
+          400: ErrorResponseSchema,
+          404: ErrorResponseSchema,
+          409: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin'),
+    },
+    async (request, reply) => {
+      const { instance_id } = request.params
+      const {
+        target_gpu_ids,
+        topology_gpu_ids,
+        placement_mode,
+        placement_gpu_id,
+        drain_timeout_ms,
+      } = request.body
+      const modelMover = getModelMover(fastify.log)
+
+      const result = await modelMover.moveModel({
+        instanceId: instance_id,
+        targetGpuIds: target_gpu_ids,
+        targetTopologyGpuIds: topology_gpu_ids,
+        targetPlacementMode: placement_mode,
+        targetPlacementGpuId: placement_gpu_id,
+        drainTimeoutMs: drain_timeout_ms,
+      })
+
+      return reply.code(202).send({
+        move_id: result.moveId,
+        source_instance_id: result.sourceInstanceId,
+        target_gpu_ids: result.targetGpuIds,
+      })
+    }
+  )
+
+  /**
+   * GET /api/models/moves/:move_id/events - SSE stream for move progress
+   */
+  fastify.get<{ Params: { move_id: string } }>(
+    '/api/models/moves/:move_id/events',
+    {
+      schema: {
+        tags: ['models', 'events'],
+        summary: 'Subscribe to move operation progress events (SSE)',
+        params: Type.Object({ move_id: Type.String({ format: 'uuid' }) }),
+        response: {
+          404: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin-readonly'),
+    },
+    async (request, reply) => {
+      const { move_id } = request.params
+      const modelMover = getModelMover(fastify.log)
+
+      const op = modelMover.getMove(move_id)
+      if (!op) {
+        throw new NotFoundError(`Move operation ${move_id} not found`)
+      }
+
+      // Set up SSE headers
+      reply.raw.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+        'Access-Control-Allow-Origin': '*',
+      })
+
+      const connectionId = randomUUID()
+
+      // Helper to send SSE event
+      const sendEvent = (event: {
+        id: string
+        phase: string
+        message: string
+        progress?: number
+        error?: string
+      }): void => {
+        try {
+          const data = JSON.stringify(event)
+          reply.raw.write(`id: ${event.id}\n`)
+          reply.raw.write(`event: move_progress\n`)
+          reply.raw.write(`data: ${data}\n\n`)
+        } catch {
+          // Connection closed
+        }
+      }
+
+      const connection = { id: connectionId, send: sendEvent }
+      modelMover.subscribeMoveEvents(move_id, connection)
+
+      // Send current status immediately
+      sendEvent({
+        id: randomUUID(),
+        phase: op.phase,
+        message: `Move operation in phase: ${op.phase}`,
+        error: op.error,
+      })
+
+      // Heartbeat
+      const heartbeat = setInterval(() => {
+        try {
+          reply.raw.write(': heartbeat\n\n')
+        } catch {
+          // Connection closed
+        }
+      }, 15000)
+
+      // Cleanup on close
+      request.raw.on('close', () => {
+        clearInterval(heartbeat)
+        modelMover.unsubscribeMoveEvents(move_id, connection)
+      })
+    }
+  )
+
+  /**
+   * DELETE /api/models/moves/:move_id - Cancel a move operation
+   */
+  fastify.delete<{
+    Params: { move_id: string }
+    Querystring: { force?: string }
+  }>(
+    '/api/models/moves/:move_id',
+    {
+      schema: {
+        tags: ['models'],
+        summary: 'Cancel a move operation',
+        description:
+          'Cancels an in-progress move. Without force, reverts to source. With force=true, completes the move immediately (may drop connections).',
+        params: Type.Object({ move_id: Type.String({ format: 'uuid' }) }),
+        querystring: Type.Object({
+          force: Type.Optional(Type.String()),
+        }),
+        response: {
+          204: Type.Null(),
+          404: ErrorResponseSchema,
+          409: ErrorResponseSchema,
+        },
+      },
+      onRequest: fastify.requireRole('admin'),
+    },
+    async (request, reply) => {
+      const { move_id } = request.params
+      const force = request.query.force === 'true'
+      const modelMover = getModelMover(fastify.log)
+
+      await modelMover.cancelMove(move_id, force)
+      return reply.code(204).send()
+    }
+  )
+
+  // Cleanup on shutdown
+  fastify.addHook('onClose', async () => {
+    await modelManager.cleanup()
+  })
+}
