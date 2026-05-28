@@ -16,6 +16,7 @@ logger = init_logger(__name__)
 def main():
     import vllm.entrypoints.cli.benchmark.main
     import vllm.entrypoints.cli.collect_env
+    import vllm.entrypoints.cli.export_multi_weights
     import vllm.entrypoints.cli.export_weights
     import vllm.entrypoints.cli.launch
     import vllm.entrypoints.cli.openai
@@ -28,6 +29,7 @@ def main():
         vllm.entrypoints.cli.openai,
         vllm.entrypoints.cli.serve,
         vllm.entrypoints.cli.export_weights,
+        vllm.entrypoints.cli.export_multi_weights,
         vllm.entrypoints.cli.launch,
         vllm.entrypoints.cli.benchmark.main,
         vllm.entrypoints.cli.collect_env,
