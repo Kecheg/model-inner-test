@@ -5,8 +5,13 @@
 
 Provides CUDA VMM-based virtualized activation memory management.  Each model
 gets a reserved VA region that is physically backed only during forward passes.
+
+Environment variables:
+  KVCACHED_ACTIVATION_POOL_ENABLED  Enable activation memory pooling (default: "true")
+  KVCACHED_ACTIVATION_KEEP_MAPPED_MS  Keep pages mapped after forward (ms, default: 0)
 """
 
+import os
 from typing import Dict, Optional
 
 import torch
@@ -14,6 +19,14 @@ import torch
 from kvcached.utils import PAGE_SIZE, align_to, get_kvcached_logger
 
 logger = get_kvcached_logger(__name__)
+
+_ACTIVATION_POOL_ENABLED = os.getenv("KVCACHED_ACTIVATION_POOL_ENABLED", "true").lower() in ("true", "1")
+_KEEP_MAPPED_MS = int(os.getenv("KVCACHED_ACTIVATION_KEEP_MAPPED_MS", "0"))
+
+
+def is_activation_pool_enabled() -> bool:
+    """Return whether activation memory pooling is enabled via env var."""
+    return _ACTIVATION_POOL_ENABLED
 
 
 class ActivationPoolManager:

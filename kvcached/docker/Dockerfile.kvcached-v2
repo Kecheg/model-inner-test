@@ -1,0 +1,14 @@
+FROM vllm-weight-share:full-sardeenz-kvcached-upstream
+
+# Install pre-built kvcached wheel
+COPY dist/kvcached-*.whl /tmp/
+RUN pip3 install /tmp/kvcached-*.whl --force-reinstall --no-deps --no-cache-dir
+RUN rm -f /tmp/kvcached-*.whl
+
+ENV ENABLE_KVCACHED=true
+ENV KVCACHED_AUTOPATCH=1
+
+EXPOSE 8080 8000
+
+ENTRYPOINT []
+CMD ["bash"]

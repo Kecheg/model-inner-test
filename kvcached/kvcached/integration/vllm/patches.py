@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 import torch
 
+from kvcached.activation_pool_manager import is_activation_pool_enabled
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
 from kvcached.utils import get_kvcached_logger
@@ -1247,7 +1248,9 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return True
 
         def _patched_alloc_kv(self, kv_cache_config, *args: Any, **kwargs: Any):
-            if enable_kvcached():
+            # Pooling models use EncoderOnlyAttentionSpec and have no
+            # generative KV cache to manage; let vLLM handle natively.
+            if enable_kvcached() and not getattr(self, "is_pooling_model", False):
                 return self._allocate_kv_cache_from_kvcached(kv_cache_config)
             return original_method(self, kv_cache_config, *args, **kwargs)
 
@@ -1313,7 +1316,7 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return True
 
         def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any):
-            if enable_kvcached():
+            if enable_kvcached() and not getattr(self, "is_pooling_model", False):
                 return self._reshape_kv_cache_tensors_from_kvcached(
                     kv_cache_config, kv_cache_raw_tensors, *args, **kwargs
                 )
@@ -1408,6 +1411,11 @@ class PoolingModelRunnerPatch(VersionAwarePatch, BasePatch):
 
             is_pooling = getattr(self, "is_pooling_model", False)
             if not is_pooling or not enable_kvcached():
+                return
+            if not is_activation_pool_enabled():
+                patch_logger.debug(
+                    "Activation pool disabled by KVCACHED_ACTIVATION_POOL_ENABLED"
+                )
                 return
 
             mem_peak = torch.cuda.max_memory_allocated()
