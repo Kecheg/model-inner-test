@@ -305,9 +305,15 @@ class Worker(WorkerBase):
 
             self.device = torch.device(f"cuda:{self.local_rank}")
 
-            # Weight Sharing: pre-open CUDA IPC handles BEFORE any CUDA
-            # context is created.  cudaIpcOpenMemHandle only succeeds when
-            # the CUDA context is pristine (no prior cudaSetDevice).
+            # Bind this worker to its local CUDA device before pre-opening
+            # weight-sharing IPC handles.  TP/PP secondary ranks must open
+            # handles with the context for their own local device; otherwise
+            # cudaIpcOpenMemHandle can see a default cuda:0 context and fail
+            # with cudaErrorInvalidDeviceContext.
+            torch.accelerator.set_device_index(self.device)
+
+            # Weight Sharing: pre-open CUDA IPC handles before distributed
+            # initialization and before heavier CUDA allocations.
             ws_config = self.vllm_config.weight_sharing_config
             if ws_config is not None and ws_config.mode == "secondary":
                 from vllm.distributed.weight_sharing import WeightSharingManager
@@ -321,7 +327,6 @@ class Worker(WorkerBase):
                     ws_config, tp_rank=tp_rank, pp_rank=pp_rank)
                 wsm.pre_open_handles(device_index=self.local_rank)
 
-            torch.accelerator.set_device_index(self.device)
             init_worker_distributed_environment(
                 self.vllm_config,
                 self.rank,
