@@ -7,7 +7,6 @@ Provides CUDA VMM-based virtualized activation memory management.  Each model
 gets a reserved VA region that is physically backed only during forward passes.
 """
 
-import logging
 from typing import Dict, Optional
 
 import torch
@@ -58,6 +57,14 @@ class ActivationPoolManager:
 
         from kvcached import vmm_ops
 
+        logger.info(
+            "[%s] Reserving VA space: %d MB (%d bytes, dtype=%s, device=%s)",
+            self.model_name,
+            self.peak_activation_bytes // (1024 * 1024),
+            self.peak_activation_bytes,
+            self.dtype,
+            self.device,
+        )
         vmm_ops.create_activation_tensor(
             self.peak_activation_bytes,
             self.dtype,
@@ -67,9 +74,9 @@ class ActivationPoolManager:
         )
         self._initialized = True
         logger.info(
-            "ActivationPoolManager[%s]: VA reserved (%d MB)",
+            "[%s] VA reserved successfully (tensor_name=%s)",
             self.model_name,
-            self.peak_activation_bytes // (1024 * 1024),
+            self._tensor_name,
         )
 
     def begin_forward(self) -> None:
@@ -80,17 +87,32 @@ class ActivationPoolManager:
         """
         if not self._initialized:
             logger.warning(
-                "ActivationPoolManager[%s]: begin_forward called before initialize",
+                "[%s] begin_forward called before initialize, skipping",
                 self.model_name,
             )
             return
         if self._mapped:
             return
 
+        num_pages = self.peak_activation_bytes // PAGE_SIZE
+        logger.info(
+            "[%s] Mapping physical pages for forward pass: "
+            "%d pages (%d MB), device=%s",
+            self.model_name,
+            num_pages,
+            self.peak_activation_bytes // (1024 * 1024),
+            self.device,
+        )
+
         from kvcached import vmm_ops
 
         vmm_ops.map_activation(self._tensor_name, self.group_id)
         self._mapped = True
+        logger.debug(
+            "[%s] Physical pages mapped successfully (tensor_name=%s)",
+            self.model_name,
+            self._tensor_name,
+        )
 
     def end_forward(self) -> None:
         """Unmap physical pages after a forward pass.
@@ -104,10 +126,24 @@ class ActivationPoolManager:
         if not self._mapped:
             return
 
+        num_pages = self.peak_activation_bytes // PAGE_SIZE
+        logger.info(
+            "[%s] Unmapping physical pages after forward pass: "
+            "%d pages (%d MB) released back to pool",
+            self.model_name,
+            num_pages,
+            self.peak_activation_bytes // (1024 * 1024),
+        )
+
         from kvcached import vmm_ops
 
         vmm_ops.unmap_activation(self._tensor_name, self.group_id)
         self._mapped = False
+        logger.debug(
+            "[%s] Physical pages unmapped successfully (tensor_name=%s)",
+            self.model_name,
+            self._tensor_name,
+        )
 
     @property
     def is_mapped(self) -> bool:
@@ -158,16 +194,21 @@ class ActivationCoordinator:
             The ActivationPoolManager for the registered model.
         """
         if model_name in self._pools:
+            logger.debug(
+                "[coordinator] Model '%s' already registered, returning existing pool",
+                model_name,
+            )
             return self._pools[model_name]
 
         # Align to page size
         aligned_bytes = align_to(peak_activation_bytes, PAGE_SIZE)
         if aligned_bytes != peak_activation_bytes:
             logger.info(
-                "ActivationCoordinator[%s]: aligned peak bytes %d -> %d",
+                "[coordinator] Aligning peak bytes for '%s': %d -> %d (%d pages)",
                 model_name,
                 peak_activation_bytes,
                 aligned_bytes,
+                aligned_bytes // PAGE_SIZE,
             )
 
         pool = ActivationPoolManager(
@@ -179,6 +220,14 @@ class ActivationCoordinator:
         )
         pool.initialize()
         self._pools[model_name] = pool
+        logger.info(
+            "[coordinator] Registered model '%s': peak=%d MB, "
+            "total models=%d, total peak=%d MB",
+            model_name,
+            aligned_bytes // (1024 * 1024),
+            len(self._pools),
+            self.total_peak_bytes // (1024 * 1024),
+        )
         return pool
 
     def get_pool(self, model_name: str) -> Optional[ActivationPoolManager]:
@@ -190,7 +239,8 @@ class ActivationCoordinator:
         pool = self._pools.get(model_name)
         if pool is None:
             logger.warning(
-                "ActivationCoordinator: unknown model '%s'", model_name
+                "[coordinator] Unknown model '%s', cannot begin_forward",
+                model_name,
             )
             return
         pool.begin_forward()
@@ -207,8 +257,15 @@ class ActivationCoordinator:
 
         Useful when putting all pooling models to sleep.
         """
-        for pool in self._pools.values():
-            pool.end_forward()
+        logger.info(
+            "[coordinator] Releasing all activation memory (%d models, %d MB total)",
+            len(self._pools),
+            self.total_peak_bytes // (1024 * 1024),
+        )
+        for name, pool in self._pools.items():
+            if pool.is_mapped:
+                logger.debug("[coordinator] Releasing model '%s'", name)
+                pool.end_forward()
 
     @property
     def total_peak_bytes(self) -> int:
