@@ -19,7 +19,12 @@ from typing import Any, Dict, List, Optional
 
 from kvcached.locks import NoOpLock
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created
-from kvcached.utils import PAGE_SIZE, SANITY_CHECK, get_kvcached_logger
+from kvcached.utils import (
+    CONTIGUOUS_LAYOUT,
+    PAGE_SIZE,
+    SANITY_CHECK,
+    get_kvcached_logger,
+)
 from kvcached.vmm_ops import kv_tensors_created
 
 try:
@@ -107,7 +112,7 @@ class KVCacheManager:
             self.world_size,
             pp_rank=self.pp_rank,
             async_sched=async_sched,
-            contiguous_layout=True,
+            contiguous_layout=CONTIGUOUS_LAYOUT,
             enable_page_prealloc=True,
             num_kv_buffers=self.num_kv_buffers,
             group_id=self.group_id,
