@@ -42,4 +42,37 @@ private:
   std::unordered_map<page_id_t, std::unique_ptr<Page>> mapping_;
 };
 
+// ActivationFTensor manages virtualized activation memory for Embedding/Rerank models.
+// Unlike FTensor (which maps/unmaps individual pages for KV Cache blocks),
+// ActivationFTensor maps ALL pages during a forward pass and unmaps ALL after.
+class ActivationFTensor {
+public:
+  ActivationFTensor(const std::string &name, size_t size, torch::Dtype dtype,
+                    torch::Device dev, std::shared_ptr<Page> zero_page,
+                    size_t page_size = 0);
+  ~ActivationFTensor();
+
+  bool map_all();
+  bool unmap_all();
+
+  inline torch::Tensor get_tensor() const noexcept { return tensor_; }
+  inline bool is_mapped() const noexcept { return mapped_; }
+  inline size_t size() const noexcept { return size_; }
+  inline const std::string &name() const noexcept { return name_; }
+
+private:
+  bool init_with_zero_();
+
+  std::string name_;
+  generic_ptr_t vaddr_;
+  size_t size_;
+  size_t page_size_;
+  bool mapped_;
+  torch::Dtype dtype_;
+  torch::Device dev_;
+  torch::Tensor tensor_;
+  std::vector<std::unique_ptr<Page>> pages_;
+  std::shared_ptr<Page> zero_page_;
+};
+
 } // namespace kvcached

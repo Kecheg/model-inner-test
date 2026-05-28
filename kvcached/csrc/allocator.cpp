@@ -360,6 +360,49 @@ void FTensorAllocator::free_ftensor_(torch::Tensor &ftensor) {
   ftensors_.erase(name);
 }
 
+torch::Tensor FTensorAllocator::create_activation_tensor(
+    size_t size, torch::Dtype dtype, const std::string &dev_str,
+    const std::string &name) {
+  std::lock_guard<std::mutex> lock(mtx_);
+
+  auto it = activation_ftensors_.find(name);
+  if (it != activation_ftensors_.end()) {
+    auto tensor = it->second->get_tensor();
+    assert(tensor.numel() * tensor.element_size() == static_cast<int64_t>(size));
+    return tensor;
+  }
+
+  auto zero_page = make_shared_page(dev_, ZERO_PAGE_ID);
+  activation_ftensors_[name] =
+      std::make_unique<ActivationFTensor>(name, size, dtype, dev_, zero_page);
+  return activation_ftensors_[name]->get_tensor();
+}
+
+bool FTensorAllocator::map_activation(const std::string &name) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  auto it = activation_ftensors_.find(name);
+  if (it == activation_ftensors_.end()) {
+    LOGGER(ERROR, "Activation tensor %s not found", name.c_str());
+    return false;
+  }
+  return it->second->map_all();
+}
+
+bool FTensorAllocator::unmap_activation(const std::string &name) {
+  std::lock_guard<std::mutex> lock(mtx_);
+  auto it = activation_ftensors_.find(name);
+  if (it == activation_ftensors_.end()) {
+    LOGGER(ERROR, "Activation tensor %s not found", name.c_str());
+    return false;
+  }
+  return it->second->unmap_all();
+}
+
+bool FTensorAllocator::has_activation(const std::string &name) const {
+  std::lock_guard<std::mutex> lock(mtx_);
+  return activation_ftensors_.find(name) != activation_ftensors_.end();
+}
+
 void FTensorAllocator::init_cuda_() {
   CHECK_RT(cudaFree(0));
 
