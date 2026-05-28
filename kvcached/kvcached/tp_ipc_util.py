@@ -6,6 +6,7 @@ import os
 import pickle
 import socket
 import threading
+import time
 import uuid
 from typing import Any, Dict, cast
 
@@ -30,6 +31,42 @@ def _get_socket_dir_name() -> str:
 # Unix domain socket paths are limited to 108 characters on Linux, so we keep
 # the directory name short and validate the final socket path length below.
 SOCKET_DIR = os.path.join("/tmp", _get_socket_dir_name())
+PROFILE_HOTPATH = os.getenv("KVCACHED_PROFILE_HOTPATH", "").lower() in (
+    "1", "true", "yes")
+PROFILE_INTERVAL_SEC = float(os.getenv("KVCACHED_PROFILE_INTERVAL_SEC", "10"))
+_profile_lock = threading.Lock()
+_profile_last_log = time.monotonic()
+_profile_stats: dict[str, dict[str, float]] = {}
+
+
+def _profile(op: str, elapsed_sec: float, items: int = 0) -> None:
+    if not PROFILE_HOTPATH:
+        return
+
+    global _profile_last_log
+    now = time.monotonic()
+    with _profile_lock:
+        stat = _profile_stats.setdefault(
+            op, {"count": 0.0, "total": 0.0, "max": 0.0, "items": 0.0})
+        stat["count"] += 1
+        stat["total"] += elapsed_sec
+        stat["max"] = max(stat["max"], elapsed_sec)
+        stat["items"] += items
+
+        if now - _profile_last_log < PROFILE_INTERVAL_SEC:
+            return
+
+        parts = []
+        for name, value in sorted(_profile_stats.items()):
+            count = max(value["count"], 1.0)
+            parts.append(
+                f"{name}: count={int(value['count'])} "
+                f"avg={value['total'] / count * 1000:.3f}ms "
+                f"max={value['max'] * 1000:.3f}ms "
+                f"items={int(value['items'])}")
+        print("KVCACHED_TP_IPC_PROFILE " + " | ".join(parts), flush=True)
+        _profile_stats.clear()
+        _profile_last_log = now
 
 
 def get_worker_socket_path(rank: int, pp_rank: int = 0) -> str:
@@ -262,18 +299,33 @@ async def _broadcast_kv_tensors_created(tp_size: int,
 def broadcast_map_to_kv_tensors(tp_size: int, offsets: list[int],
                                 pp_rank: int = 0,
                                 group_id: int = 0) -> None:
-    asyncio.run(_broadcast_map_to_kv_tensors(tp_size, offsets, pp_rank,
-                                             group_id))
+    start = time.perf_counter()
+    try:
+        asyncio.run(_broadcast_map_to_kv_tensors(tp_size, offsets, pp_rank,
+                                                 group_id))
+    finally:
+        _profile("tp_ipc.broadcast_map", time.perf_counter() - start,
+                 len(offsets))
 
 
 def broadcast_unmap_from_kv_tensors(tp_size: int, offsets: list[int],
                                     pp_rank: int = 0,
                                     group_id: int = 0) -> None:
-    asyncio.run(_broadcast_unmap_from_kv_tensors(tp_size, offsets, pp_rank,
-                                                 group_id))
+    start = time.perf_counter()
+    try:
+        asyncio.run(_broadcast_unmap_from_kv_tensors(tp_size, offsets, pp_rank,
+                                                     group_id))
+    finally:
+        _profile("tp_ipc.broadcast_unmap", time.perf_counter() - start,
+                 len(offsets))
 
 
 def broadcast_kv_tensors_created(tp_size: int, pp_rank: int = 0,
                                  group_id: int = 0) -> bool:
-    return asyncio.run(_broadcast_kv_tensors_created(tp_size, pp_rank,
-                                                     group_id))
+    start = time.perf_counter()
+    try:
+        return asyncio.run(_broadcast_kv_tensors_created(tp_size, pp_rank,
+                                                         group_id))
+    finally:
+        _profile("tp_ipc.kv_tensors_created", time.perf_counter() - start,
+                 tp_size)

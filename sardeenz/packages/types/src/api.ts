@@ -17,6 +17,7 @@ export interface LoadModelRequest {
   gpu_ids?: number[] // Optional explicit GPU selection (auto-selects if not provided)
   topology_gpu_ids?: number[] // Optional scheduling domain; useful when concentrated placement belongs to a larger GPU pair/domain
   tensor_parallel_size?: number // For large models spanning multiple GPUs (default: 1)
+  pipeline_parallel_size?: number // Optional PP size; execution GPUs require TP * PP
   placement_mode?: 'balanced' | 'concentrated'
   placement_gpu_id?: number // For concentrated placement, select which GPU inside topology_gpu_ids should host weights/KV
   source_type?: ModelSourceType // Model source type (default: 'huggingface')

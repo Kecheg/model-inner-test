@@ -27,6 +27,7 @@ COPY vllm/model_executor/model_loader/base_loader.py /tmp/ws/model_executor/mode
 COPY vllm/model_executor/model_loader/default_loader.py /tmp/ws/model_executor/model_loader/default_loader.py
 COPY vllm/model_executor/model_loader/utils.py /tmp/ws/model_executor/model_loader/utils.py
 COPY vllm/v1/worker/gpu_model_runner.py /tmp/ws/v1/worker/gpu_model_runner.py
+COPY vllm/v1/worker/gpu_worker.py /tmp/ws/v1/worker/gpu_worker.py
 COPY kvcached/ /opt/kvcached/
 
 RUN SITE=$(python3 -c "import vllm,os;print(os.path.dirname(vllm.__file__))") \
@@ -39,6 +40,7 @@ RUN SITE=$(python3 -c "import vllm,os;print(os.path.dirname(vllm.__file__))") \
     && cp /tmp/ws/model_executor/model_loader/default_loader.py "$SITE/model_executor/model_loader/default_loader.py" \
     && cp /tmp/ws/model_executor/model_loader/utils.py "$SITE/model_executor/model_loader/utils.py" \
     && cp /tmp/ws/v1/worker/gpu_model_runner.py "$SITE/v1/worker/gpu_model_runner.py" \
+    && cp /tmp/ws/v1/worker/gpu_worker.py "$SITE/v1/worker/gpu_worker.py" \
     && cp /tmp/ws/distributed/weight_sharing/*.py "$SITE/distributed/weight_sharing/" \
     && rm -rf /tmp/ws \
     && python3 -m pip install --progress-bar off --no-cache-dir "wrapt>=1.15" "posix_ipc>=1.0" \
@@ -47,6 +49,7 @@ RUN SITE=$(python3 -c "import vllm,os;print(os.path.dirname(vllm.__file__))") \
     && python3 -m py_compile \
         "$SITE/distributed/weight_sharing/manager.py" \
         "$SITE/distributed/weight_sharing/parameter_filter.py" \
+        "$SITE/v1/worker/gpu_worker.py" \
         /usr/local/lib/python3.12/dist-packages/kvcached/kv_cache_manager.py \
         /usr/local/lib/python3.12/dist-packages/kvcached/integration/vllm/patches.py \
     && python3 -c "from vllm.distributed.weight_sharing.parameter_filter import is_shareable_parameter; from vllm.config.weight_sharing import WeightSharingConfig; assert is_shareable_parameter('model.layers.0.qkv.weight') is True; assert is_shareable_parameter('model.embed_tokens.weight') is False; print('Weight sharing verified OK')"

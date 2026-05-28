@@ -546,6 +546,8 @@ def _patch_shareable_quant_postprocess(model, shareable_names: set[str]) -> None
 
         def _make_stub(mkw=marlin_make_workspace_new):
             def _stub(layer: torch.nn.Module) -> None:
+                if not hasattr(layer, "input_scale"):
+                    layer.input_scale = None
                 if not hasattr(layer, "workspace"):
                     cuda_dev = torch.device("cuda", torch.cuda.current_device())
                     layer.workspace = mkw(cuda_dev, max_blocks_per_sm=4)
@@ -564,5 +566,7 @@ def _ensure_workspace(model) -> None:
     cuda_dev = torch.device("cuda", torch.cuda.current_device())
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None and not hasattr(module, "input_scale"):
+            module.input_scale = None
         if quant_method is not None and not hasattr(module, "workspace"):
             module.workspace = marlin_make_workspace_new(cuda_dev, max_blocks_per_sm=4)

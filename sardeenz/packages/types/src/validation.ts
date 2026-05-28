@@ -66,6 +66,7 @@ export const LoadModelRequestSchema = Type.Object({
   gpu_ids: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 15 }))),
   topology_gpu_ids: Type.Optional(Type.Array(Type.Integer({ minimum: 0, maximum: 15 }))),
   tensor_parallel_size: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
+  pipeline_parallel_size: Type.Optional(Type.Integer({ minimum: 1, maximum: 8 })),
   placement_mode: Type.Optional(Type.Union([Type.Literal('balanced'), Type.Literal('concentrated')])),
   placement_gpu_id: Type.Optional(Type.Integer({ minimum: 0, maximum: 15 })),
   source_type: Type.Optional(ModelSourceTypeSchema),
