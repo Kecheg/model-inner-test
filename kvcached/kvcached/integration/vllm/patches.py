@@ -1244,8 +1244,6 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return False
 
         original_method = getattr(GPUModelRunner, "_allocate_kv_cache_tensors")
-        if self._is_already_patched(original_method, "alloc_kv_cache_tensors"):
-            return True
 
         def _patched_alloc_kv(self, kv_cache_config, *args: Any, **kwargs: Any):
             # Pooling models use EncoderOnlyAttentionSpec and have no
@@ -1254,7 +1252,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 return self._allocate_kv_cache_from_kvcached(kv_cache_config)
             return original_method(self, kv_cache_config, *args, **kwargs)
 
-        self._mark_as_patched(_patched_alloc_kv, "alloc_kv_cache_tensors")
+        # NOTE: always overwrite — older kvcached versions may have already
+        # patched this method without the pooling-model guard.
         setattr(GPUModelRunner, "_allocate_kv_cache_tensors", _patched_alloc_kv)
         return True
 
@@ -1312,8 +1311,6 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return False
 
         original_method = getattr(GPUModelRunner, "_reshape_kv_cache_tensors")
-        if self._is_already_patched(original_method, "reshape_kv_cache_tensors"):
-            return True
 
         def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any):
             if enable_kvcached() and not getattr(self, "is_pooling_model", False):
@@ -1322,7 +1319,8 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                 )
             return original_method(self, kv_cache_config, kv_cache_raw_tensors, *args, **kwargs)
 
-        self._mark_as_patched(_patched_reshape_kv, "reshape_kv_cache_tensors")
+        # NOTE: always overwrite — older kvcached versions may have already
+        # patched this method without the pooling-model guard.
         setattr(GPUModelRunner, "_reshape_kv_cache_tensors", _patched_reshape_kv)
         return True
 
