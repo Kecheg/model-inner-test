@@ -21,6 +21,8 @@ from kvcached.locks import NoOpLock
 from kvcached.tp_ipc_util import broadcast_kv_tensors_created
 from kvcached.utils import (
     CONTIGUOUS_LAYOUT,
+    DEFAULT_IPC_NAME,
+    PAGE_PREALLOC_ENABLED,
     PAGE_SIZE,
     SANITY_CHECK,
     get_kvcached_logger,
@@ -113,9 +115,10 @@ class KVCacheManager:
             pp_rank=self.pp_rank,
             async_sched=async_sched,
             contiguous_layout=CONTIGUOUS_LAYOUT,
-            enable_page_prealloc=True,
+            enable_page_prealloc=PAGE_PREALLOC_ENABLED,
             num_kv_buffers=self.num_kv_buffers,
             group_id=self.group_id,
+            ipc_name=DEFAULT_IPC_NAME,
         )
         # Register should_use_worker_ipc callback so C++ PageAllocator
         # knows when to use broadcast IPC even with world_size == 1
@@ -218,6 +221,7 @@ class KVCacheManager:
             # KV tensors created now
             # Possibly reserve the first block as null block for padding tokens
             self._reserve_null_block()
+
             if not self._defer_prealloc_until_first_alloc:
                 self._start_prealloc_thread()
         except Exception as e:
@@ -257,11 +261,9 @@ class KVCacheManager:
             # finished and then perform the usual capacity check.
             self._wait_post_init()
 
-        # todo: check if we need to resize
-        #new_mem_size = self.page_allocator.mem_info_tracker.check_and_get_resize_target(
-        #    self.mem_size, self.num_layers, self.num_kv_buffers)
-        #if new_mem_size is not None:
-        #    self.resize(new_mem_size)
+        new_mem_size = self.page_allocator.get_resize_target()
+        if new_mem_size > 0:
+            self.resize(new_mem_size)
 
         if self.available_size() < need_size:
             logger.warning(f"available_size()={self.available_size()} < "
@@ -458,7 +460,7 @@ class KVCacheManager:
 
         self._wait_post_init()
 
-        # Stop the prealloc thread first 鈥?it runs on the PageAllocator's
+        # Stop the prealloc thread first — it runs on the PageAllocator's
         # lock and can grab pages between our trim/reset/reserve steps,
         # causing the null-block reservation to get a non-zero block.
         self.page_allocator._stop_prealloc_thread(
@@ -486,7 +488,7 @@ class KVCacheManager:
         # After free_pages + trim, freed pages are appended to the END of
         # free_page_list, so the order is scrambled.  This matters because
         # _reserve_null_block() pops from the LEFT and expects to get page 0
-        # (which yields block 0 鈥?the null block SGLang requires).
+        # (which yields block 0 — the null block SGLang requires).
         self.page_allocator.reset_free_page_order()
 
         self.target_num_blocks = None
