@@ -58,6 +58,8 @@ export interface Config {
   kvAdmissionQueuePollMs: number
   kvAdmissionReservationTtlMs: number
   kvAdmissionEstimateTokensPerGiB: number
+  kvAdmissionMaxInstanceInflight: number
+  kvAdmissionMaxGpuGroupInflight: number
   kvAdmissionDefaultMinGuaranteeGiBPerGpu: number
   kvAdmissionDefaultSoftLimitGiBPerGpu: number
   kvAdmissionDefaultHardLimitGiBPerGpu: number
@@ -237,6 +239,8 @@ export const config: Config = {
   kvAdmissionQueuePollMs: getEnvInt('KV_ADMISSION_QUEUE_POLL_MS', 50),
   kvAdmissionReservationTtlMs: getEnvInt('KV_ADMISSION_RESERVATION_TTL_MS', 3600000),
   kvAdmissionEstimateTokensPerGiB: getEnvFloat('KV_ADMISSION_ESTIMATE_TOKENS_PER_GIB', 32768),
+  kvAdmissionMaxInstanceInflight: getEnvInt('KV_ADMISSION_MAX_INSTANCE_INFLIGHT', 0),
+  kvAdmissionMaxGpuGroupInflight: getEnvInt('KV_ADMISSION_MAX_GPU_GROUP_INFLIGHT', 0),
   kvAdmissionDefaultMinGuaranteeGiBPerGpu: getEnvFloat(
     'KV_DEFAULT_INSTANCE_MIN_GUARANTEE_GIB_PER_GPU',
     5

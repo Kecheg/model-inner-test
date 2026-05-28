@@ -184,16 +184,27 @@ class KvAdmissionController {
 
     const byGroup: Record<string, number> = {}
     const byInstance: Record<string, number> = {}
+    const inflightByGroup: Record<string, number> = {}
+    const inflightByInstance: Record<string, number> = {}
     for (const reservation of this.reservations.values()) {
       byGroup[reservation.gpuGroup] =
         (byGroup[reservation.gpuGroup] ?? 0) + reservation.estimatedGiBPerGpu
       byInstance[reservation.instanceId] =
         (byInstance[reservation.instanceId] ?? 0) + reservation.estimatedGiBPerGpu
+      inflightByGroup[reservation.gpuGroup] = (inflightByGroup[reservation.gpuGroup] ?? 0) + 1
+      inflightByInstance[reservation.instanceId] =
+        (inflightByInstance[reservation.instanceId] ?? 0) + 1
     }
     return {
       enabled: this.isEnabled(),
       byGroup,
       byInstance,
+      inflightByGroup,
+      inflightByInstance,
+      limits: {
+        maxInstanceInflight: config.kvAdmissionMaxInstanceInflight,
+        maxGpuGroupInflight: config.kvAdmissionMaxGpuGroupInflight,
+      },
       reservationCount: this.reservations.size,
     }
   }
@@ -214,12 +225,48 @@ class KvAdmissionController {
     const groupActive = this.activeForGroup(gpuGroup)
     const nextInstanceActive = instanceActive + estimatedGiBPerGpu
     const nextGroupActive = groupActive + estimatedGiBPerGpu
+    const instanceInflight = this.inflightForInstance(instance.id)
+    const groupInflight = this.inflightForGroup(gpuGroup)
     const protectedMinimumGiBPerGpu = this.protectedMinimumForOtherInstances(instance, gpuGroup)
     const ownMinimumDeficitGiBPerGpu = Math.max(
       0,
       quota.minGuaranteeGiBPerGpu - instanceActive
     )
     const ownMinimumDrawGiBPerGpu = Math.min(estimatedGiBPerGpu, ownMinimumDeficitGiBPerGpu)
+
+    if (
+      config.kvAdmissionMaxInstanceInflight > 0 &&
+      instanceInflight >= config.kvAdmissionMaxInstanceInflight
+    ) {
+      return this.rejectInflight(
+        `Instance inflight requests ${instanceInflight} reached limit ${config.kvAdmissionMaxInstanceInflight}`,
+        estimatedGiBPerGpu,
+        requestTokens,
+        instanceActive,
+        groupActive,
+        quota,
+        globalLimit,
+        instanceInflight,
+        groupInflight
+      )
+    }
+
+    if (
+      config.kvAdmissionMaxGpuGroupInflight > 0 &&
+      groupInflight >= config.kvAdmissionMaxGpuGroupInflight
+    ) {
+      return this.rejectInflight(
+        `GPU group ${gpuGroup} inflight requests ${groupInflight} reached limit ${config.kvAdmissionMaxGpuGroupInflight}`,
+        estimatedGiBPerGpu,
+        requestTokens,
+        instanceActive,
+        groupActive,
+        quota,
+        globalLimit,
+        instanceInflight,
+        groupInflight
+      )
+    }
 
     if (estimatedGiBPerGpu > quota.hardLimitGiBPerGpu) {
       return this.reject(
@@ -309,6 +356,41 @@ class KvAdmissionController {
     }
   }
 
+  private rejectInflight(
+    message: string,
+    estimatedGiBPerGpu: number,
+    requestTokens: number,
+    instanceActiveGiBPerGpu: number,
+    groupActiveGiBPerGpu: number,
+    quota: InstanceQuota,
+    globalLimitGiBPerGpu: number,
+    instanceInflight: number,
+    groupInflight: number
+  ): AdmissionResult {
+    return {
+      allowed: false,
+      statusCode: 429,
+      error: {
+        message,
+        type: 'kv_admission_error',
+        code: 'KV_INFLIGHT_LIMIT_EXCEEDED',
+        retry_after_ms: config.kvAdmissionMaxQueueMs,
+        details: {
+          estimatedGiBPerGpu,
+          requestTokens,
+          instanceActiveGiBPerGpu,
+          groupActiveGiBPerGpu,
+          quota,
+          globalLimitGiBPerGpu,
+          instanceInflight,
+          groupInflight,
+          maxInstanceInflight: config.kvAdmissionMaxInstanceInflight,
+          maxGpuGroupInflight: config.kvAdmissionMaxGpuGroupInflight,
+        },
+      },
+    }
+  }
+
   private reject(
     statusCode: number,
     message: string,
@@ -356,6 +438,26 @@ class KvAdmissionController {
     for (const reservation of this.reservations.values()) {
       if (reservation.gpuGroup === gpuGroup) {
         total += reservation.estimatedGiBPerGpu
+      }
+    }
+    return total
+  }
+
+  private inflightForInstance(instanceId: string): number {
+    let total = 0
+    for (const reservation of this.reservations.values()) {
+      if (reservation.instanceId === instanceId) {
+        total++
+      }
+    }
+    return total
+  }
+
+  private inflightForGroup(gpuGroup: string): number {
+    let total = 0
+    for (const reservation of this.reservations.values()) {
+      if (reservation.gpuGroup === gpuGroup) {
+        total++
       }
     }
     return total
