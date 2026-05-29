@@ -144,28 +144,49 @@ class PatchManager:
 
     def _apply_single_patch(self, patch: BasePatch) -> bool:
         """Apply a single patch"""
+        self.logger.warning(
+            "[%s] Attempting patch: module=%s class=%s",
+            patch.patch_name, patch.target_module, patch.target_class or "(none)",
+        )
         try:
             # Import target module
             if patch.target_module is None:
-                self.logger.error(f"target_module not specified for {patch.patch_name}")
+                self.logger.error(
+                    "[%s] target_module not specified", patch.patch_name
+                )
                 return False
             target_module = importlib.import_module(patch.target_module)
+            self.logger.warning(
+                "[%s] Module imported: %s", patch.patch_name, target_module
+            )
 
             # Check if patch can be applied
             if not patch.can_apply(target_module):
-                self.logger.debug(f"Skipping {patch.patch_name} - prerequisites not met")
+                self.logger.warning(
+                    "[%s] Prerequisites NOT met (class=%s NOT in module)",
+                    patch.patch_name, patch.target_class or "(none)",
+                )
                 return False
 
             # Apply the patch
-            return patch.apply(target_module)
+            self.logger.warning("[%s] Applying patch...", patch.patch_name)
+            ok = patch.apply(target_module)
+            self.logger.warning(
+                "[%s] Patch %s", patch.patch_name,
+                "SUCCEEDED" if ok else "FAILED",
+            )
+            return ok
 
         except ImportError as e:
-            self.logger.error(
-                f"Could not import target module {patch.target_module} for {patch.patch_name}: {e}"
+            self.logger.warning(
+                "[%s] ImportError for %s: %s",
+                patch.patch_name, patch.target_module, e,
             )
             return False
         except Exception as e:
-            self.logger.error(f"Unexpected error applying {patch.patch_name}: {e}")
+            self.logger.warning(
+                "[%s] Exception: %s", patch.patch_name, e,
+            )
             return False
 
 

@@ -178,6 +178,34 @@ page_allocator_group_indices_by_page(std::shared_ptr<PageAllocator> allocator,
 
 } // namespace kvcached
 
+namespace {
+
+torch::Tensor create_activation_tensor(size_t size, const py::object &dtype,
+                                       const std::string &dev_str,
+                                       const std::string &name,
+                                       int64_t group_id = 0) {
+  // Convert dtype FIRST while the GIL is still held (torch_dtype_cast
+  // calls py::module_::import("torch") which needs the GIL).
+  auto dtype_ = kvcached::torch_dtype_cast(dtype);
+  py::gil_scoped_release release;
+  auto allocator = kvcached::FTensorAllocator::global_allocator(group_id);
+  return allocator->create_activation_tensor(size, dtype_, dev_str, name);
+}
+
+bool map_activation(const std::string &name, int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = kvcached::FTensorAllocator::global_allocator(group_id);
+  return allocator->map_activation(name);
+}
+
+bool unmap_activation(const std::string &name, int64_t group_id = 0) {
+  py::gil_scoped_release release;
+  auto allocator = kvcached::FTensorAllocator::global_allocator(group_id);
+  return allocator->unmap_activation(name);
+}
+
+} // namespace
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.doc() = "kvcached VMM plugin";
 
@@ -195,6 +223,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("offsets"), py::arg("group_id") = 0);
   m.def("unmap_from_kv_tensors", &kvcached::unmap_from_kv_tensors,
         "unmap_from_kv_tensors", py::arg("offsets"), py::arg("group_id") = 0);
+
+  m.def("create_activation_tensor", &create_activation_tensor,
+        "Create a virtualized activation tensor for Embedding/Rerank models",
+        py::arg("size"), py::arg("dtype"), py::arg("dev_str"),
+        py::arg("name"), py::arg("group_id") = 0);
+  m.def("map_activation", &map_activation,
+        "Map physical pages for an activation tensor",
+        py::arg("name"), py::arg("group_id") = 0);
+  m.def("unmap_activation", &unmap_activation,
+        "Unmap physical pages for an activation tensor",
+        py::arg("name"), py::arg("group_id") = 0);
 
   // PageAllocator bindings
   py::class_<kvcached::PageAllocator, std::shared_ptr<kvcached::PageAllocator>>(

@@ -14,9 +14,12 @@ import types
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
+import torch
+
+from kvcached.activation_pool_manager import is_activation_pool_enabled
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
-from kvcached.utils import get_kvcached_logger
+from kvcached.utils import PAGE_SIZE, get_kvcached_logger
 
 _hotpath_logger = get_kvcached_logger()
 _hotpath_profile_enabled = os.getenv("KVCACHED_PROFILE_HOTPATH", "").lower() in (
@@ -759,8 +762,12 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
 
             try:
                 self._setup_kvcached_coordinator()
-            except Exception:
-                logger.warning("Failed to patch kv_cache_coordinator")
+            except Exception as e:
+                logger.warning(
+                    "kvcached kv_cache_coordinator patch skipped: %s "
+                    "(this is expected for pooling / encoder-only models)",
+                    e,
+                )
                 return
 
         def _setup_kvcached_coordinator(self) -> None:
@@ -1301,15 +1308,16 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return False
 
         original_method = getattr(GPUModelRunner, "_allocate_kv_cache_tensors")
-        if self._is_already_patched(original_method, "alloc_kv_cache_tensors"):
-            return True
 
         def _patched_alloc_kv(self, kv_cache_config, *args: Any, **kwargs: Any):
-            if enable_kvcached():
+            # Pooling models use EncoderOnlyAttentionSpec and have no
+            # generative KV cache to manage; let vLLM handle natively.
+            if enable_kvcached() and not getattr(self, "is_pooling_model", False):
                 return self._allocate_kv_cache_from_kvcached(kv_cache_config)
             return original_method(self, kv_cache_config, *args, **kwargs)
 
-        self._mark_as_patched(_patched_alloc_kv, "alloc_kv_cache_tensors")
+        # NOTE: always overwrite — older kvcached versions may have already
+        # patched this method without the pooling-model guard.
         setattr(GPUModelRunner, "_allocate_kv_cache_tensors", _patched_alloc_kv)
         return True
 
@@ -1367,17 +1375,16 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return False
 
         original_method = getattr(GPUModelRunner, "_reshape_kv_cache_tensors")
-        if self._is_already_patched(original_method, "reshape_kv_cache_tensors"):
-            return True
 
         def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any):
-            if enable_kvcached():
+            if enable_kvcached() and not getattr(self, "is_pooling_model", False):
                 return self._reshape_kv_cache_tensors_from_kvcached(
                     kv_cache_config, kv_cache_raw_tensors, *args, **kwargs
                 )
             return original_method(self, kv_cache_config, kv_cache_raw_tensors, *args, **kwargs)
 
-        self._mark_as_patched(_patched_reshape_kv, "reshape_kv_cache_tensors")
+        # NOTE: always overwrite — older kvcached versions may have already
+        # patched this method without the pooling-model guard.
         setattr(GPUModelRunner, "_reshape_kv_cache_tensors", _patched_reshape_kv)
         return True
 
@@ -1414,6 +1421,191 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
             return self.get_attention_backend_v8(model_runner_instance, kv_cache_group_id)
         else:
             raise ValueError(f"Unsupported vLLM version: {self.detected_version}")
+
+
+class PoolingModelRunnerPatch(VersionAwarePatch, BasePatch):
+    """Patch GPUModelRunner for pooling model activation memory management.
+
+    Uses lazy-initialisation: the first call to execute_model for a pooling
+    model profiles peak activation memory, creates the VMM-backed pool, and
+    then manages the map / unmap cycle for every subsequent forward.
+    """
+
+    library = "vllm"
+    target_module = "vllm.v1.worker.gpu_model_runner"
+    target_class = "GPUModelRunner"
+    patch_name = "pooling_model_runner"
+
+    def apply(self, gpumr_mod: types.ModuleType) -> bool:
+        if not self.initialize_version_info():
+            self.logger.warning(
+                "[pooling_model_runner] Version detection FAILED"
+            )
+            return False
+
+        GPUModelRunner = self._get_target_class(gpumr_mod)
+        if GPUModelRunner is None:
+            self.logger.warning(
+                "[pooling_model_runner v2.1] GPUModelRunner NOT found in %s "
+                "(available: %s)",
+                gpumr_mod.__name__,
+                [n for n in dir(gpumr_mod) if not n.startswith("_")][:20],
+            )
+            return False
+        self.logger.warning(
+            "[pooling_model_runner v2.1] GPUModelRunner FOUND at %s.%s — "
+            "will lazy-init activation pool on first execute_model",
+            gpumr_mod.__name__, "GPUModelRunner",
+        )
+
+        success = True
+        for method in self.applicable_methods:
+            try:
+                if method(GPUModelRunner):
+                    self.logger.warning(
+                        "[pooling_model_runner] Applied method: %s", method.__name__
+                    )
+                else:
+                    self.logger.warning(
+                        "[pooling_model_runner] Method FAILED: %s", method.__name__
+                    )
+                    success = False
+            except Exception as e:
+                self.logger.warning(
+                    "[pooling_model_runner] Exception in %s: %s",
+                    method.__name__, e,
+                )
+                success = False
+
+        return success
+
+    @staticmethod
+    def _lazy_init_pool(runner) -> None:
+        """Profile activation memory and create the pool (one-shot)."""
+        patch_logger = get_kvcached_logger("PoolingModelRunnerPatch")
+
+        patch_logger.warning(
+            "[%s] First forward — profiling activation memory to init pool",
+            getattr(runner.model_config, "model", "unknown"),
+        )
+
+        # Release PyTorch cached memory before measuring.
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        mem_before = torch.cuda.memory_allocated()
+
+        # Run a minimal dummy forward to measure activation footprint.
+        max_tokens = getattr(runner, "max_num_tokens", 1)
+        runner._dummy_run(max_tokens, is_profile=False, skip_eplb=True)
+
+        mem_peak = torch.cuda.max_memory_allocated()
+        activation_bytes = mem_peak - mem_before
+
+        if activation_bytes <= 0:
+            patch_logger.warning(
+                "[%s] Activation delta is %d bytes — pool disabled",
+                getattr(runner.model_config, "model", "unknown"),
+                activation_bytes,
+            )
+            return
+
+        from kvcached.activation_pool_manager import ActivationCoordinator
+
+        model_name = getattr(runner.model_config, "model", "unknown")
+        coordinator = ActivationCoordinator()
+        coordinator.register_model(
+            model_name=model_name,
+            peak_activation_bytes=activation_bytes,
+            dtype=runner.model_config.dtype,
+            device=str(runner.device),
+        )
+        runner._activation_coordinator = coordinator
+        patch_logger.warning(
+            "[%s] Activation pool initialised: peak=%d MB (%d pages)",
+            model_name,
+            activation_bytes // (1024 * 1024),
+            activation_bytes // PAGE_SIZE,
+        )
+
+    @version_range(VLLM_ALL_RANGE)
+    def patch_execute_model(self, GPUModelRunner) -> bool:
+        """Patch execute_model with lazy-init activation pool + lifecycle."""
+        # NOTE: no _is_already_patched guard — always overwrite so upgrades
+        # that fix this patch take effect.
+
+        original_execute = GPUModelRunner.execute_model
+        patch_logger = get_kvcached_logger("PoolingModelRunnerPatch")
+
+        def _patched_execute(self, scheduler_output, *args, **kwargs):
+            is_pooling = getattr(self, "is_pooling_model", False)
+            if not is_pooling:
+                return original_execute(self, scheduler_output, *args, **kwargs)
+            patch_logger.warning(
+                "[v2.1] execute_model ENTRY: is_pooling=True, kvcached=%s, "
+                "pool_enabled=%s, coordinator=%s",
+                enable_kvcached(), is_activation_pool_enabled(),
+                hasattr(self, "_activation_coordinator"),
+            )
+            if not enable_kvcached():
+                return original_execute(self, scheduler_output, *args, **kwargs)
+            if not is_activation_pool_enabled():
+                return original_execute(self, scheduler_output, *args, **kwargs)
+
+            coordinator = getattr(self, "_activation_coordinator", None)
+
+            # --- Lazy-init on first forward ---
+            if coordinator is None:
+                try:
+                    PoolingModelRunnerPatch._lazy_init_pool(self)
+                except Exception:
+                    patch_logger.warning(
+                        "[%s] Lazy pool init failed; running without "
+                        "activation pool",
+                        getattr(self.model_config, "model", "unknown"),
+                    )
+                    return original_execute(
+                        self, scheduler_output, *args, **kwargs
+                    )
+                coordinator = self._activation_coordinator
+                if coordinator is None:
+                    return original_execute(
+                        self, scheduler_output, *args, **kwargs
+                    )
+                # Pool was just created; run forward with begin/end.
+                model_name = getattr(self.model_config, "model", "unknown")
+                coordinator.begin_forward(model_name)
+                try:
+                    return original_execute(
+                        self, scheduler_output, *args, **kwargs
+                    )
+                finally:
+                    coordinator.end_forward(model_name)
+
+            # --- Normal forward with activation pool ---
+            model_name = getattr(self.model_config, "model", "unknown")
+            try:
+                coordinator.begin_forward(model_name)
+            except Exception:
+                patch_logger.warning(
+                    "[%s] begin_forward failed; continuing without "
+                    "activation pool",
+                    model_name,
+                )
+            try:
+                return original_execute(
+                    self, scheduler_output, *args, **kwargs
+                )
+            finally:
+                try:
+                    coordinator.end_forward(model_name)
+                except Exception:
+                    patch_logger.warning(
+                        "[%s] end_forward failed", model_name
+                    )
+
+        self._mark_as_patched(_patched_execute, "execute_model_pool")
+        GPUModelRunner.execute_model = _patched_execute
+        return True
 
 
 class GPUWorkerPatch(VersionAwarePatch, BasePatch):

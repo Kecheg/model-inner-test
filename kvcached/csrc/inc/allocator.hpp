@@ -34,6 +34,14 @@ public:
   bool map_to_kv_tensors(const std::vector<offset_t> &offsets);
   bool unmap_from_kv_tensors(const std::vector<offset_t> &offsets);
 
+  // Activation memory interfaces.
+  torch::Tensor create_activation_tensor(size_t size, torch::Dtype dtype,
+                                         const std::string &dev_str,
+                                         const std::string &name);
+  bool map_activation(const std::string &name);
+  bool unmap_activation(const std::string &name);
+  bool has_activation(const std::string &name) const;
+
   // Global status interfaces.
   // init() creates the default allocator (group_id=0).
   // global_allocator(group_id) returns the allocator for the given group,
@@ -83,6 +91,9 @@ private:
   std::unordered_map<std::string, std::unique_ptr<FTensor>> ftensors_;
   // For contiguous layout: single tensor containing all layers
   std::unique_ptr<FTensor> contiguous_kv_tensor_;
+  // Activation tensors for Embedding/Rerank models
+  std::unordered_map<std::string, std::unique_ptr<ActivationFTensor>>
+      activation_ftensors_;
   std::shared_ptr<Page> zero_page_;
 };
 

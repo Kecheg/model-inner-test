@@ -12,6 +12,8 @@ static inline torch::Dtype torch_dtype_cast(const py::object &dtype) {
     return torch::kFloat64;
   if (dtype.is(py::module_::import("torch").attr("float16")))
     return torch::kFloat16;
+  if (dtype.is(py::module_::import("torch").attr("bfloat16")))
+    return torch::kBFloat16;
   if (dtype.is(py::module_::import("torch").attr("int32")))
     return torch::kInt32;
   if (dtype.is(py::module_::import("torch").attr("int64")))

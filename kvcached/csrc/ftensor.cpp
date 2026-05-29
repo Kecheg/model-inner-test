@@ -148,4 +148,90 @@ bool FTensor::init_with_zero_() {
   return succ;
 }
 
+// --- ActivationFTensor ---
+
+ActivationFTensor::ActivationFTensor(const std::string &name, size_t size,
+                                     torch::Dtype dtype, torch::Device dev,
+                                     std::shared_ptr<Page> zero_page,
+                                     size_t page_size)
+    : name_(name), vaddr_(nullptr), size_(size),
+      page_size_(page_size > 0 ? page_size : kPageSize), mapped_(false),
+      dtype_(dtype), dev_(dev), zero_page_(zero_page) {
+  vaddr_ = alloc_virtual_mem(dev_, size_);
+  init_with_zero_();
+
+  auto num_elems = static_cast<int64_t>(size / torch::elementSize(dtype_));
+  auto options =
+      torch::TensorOptions().dtype(dtype_).device(dev_).requires_grad(false);
+  tensor_ =
+      torch::from_blob(reinterpret_cast<void *>(vaddr_), {num_elems}, options);
+}
+
+ActivationFTensor::~ActivationFTensor() {
+  if (mapped_) {
+    unmap_all();
+  }
+  pages_.clear();
+  zero_page_.reset();
+  if (vaddr_) {
+    CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr_), size_));
+    CHECK_DRV(cuMemAddressFree(reinterpret_cast<CUdeviceptr>(vaddr_), size_));
+  }
+}
+
+bool ActivationFTensor::map_all() {
+  if (mapped_)
+    return true;
+
+  size_t num_pages = size_ / page_size_;
+  pages_.clear();
+  pages_.reserve(num_pages);
+
+  for (size_t i = 0; i < num_pages; i++) {
+    offset_t offset = i * page_size_;
+    auto vaddr = reinterpret_cast<generic_ptr_t>(
+        reinterpret_cast<uintptr_t>(vaddr_) + offset);
+
+    CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), page_size_));
+
+    pages_.push_back(make_unique_page(dev_, static_cast<page_id_t>(i), page_size_));
+    pages_.back()->map(vaddr);
+  }
+  mapped_ = true;
+  return true;
+}
+
+bool ActivationFTensor::unmap_all() {
+  if (!mapped_)
+    return true;
+
+  for (size_t i = 0; i < pages_.size(); i++) {
+    offset_t offset = i * page_size_;
+    auto vaddr = reinterpret_cast<generic_ptr_t>(
+        reinterpret_cast<uintptr_t>(vaddr_) + offset);
+
+    CHECK_DRV(cuMemUnmap(reinterpret_cast<CUdeviceptr>(vaddr), page_size_));
+  }
+  pages_.clear();
+  mapped_ = false;
+
+  // Restore zero page mapping to maintain memory integrity.
+  init_with_zero_();
+  return true;
+}
+
+bool ActivationFTensor::init_with_zero_() {
+  assert(reinterpret_cast<uintptr_t>(vaddr_) % page_size_ == 0);
+  assert(size_ % page_size_ == 0);
+
+  for (size_t offset = 0; offset < size_; offset += page_size_) {
+    auto vaddr = reinterpret_cast<void *>(
+        reinterpret_cast<uintptr_t>(vaddr_) + offset);
+    if (!zero_page_->map(vaddr, /* set_access = */ true)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace kvcached
