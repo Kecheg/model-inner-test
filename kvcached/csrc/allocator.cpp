@@ -369,12 +369,15 @@ torch::Tensor FTensorAllocator::create_activation_tensor(
   if (it != activation_ftensors_.end()) {
     auto tensor = it->second->get_tensor();
     assert(tensor.numel() * tensor.element_size() == static_cast<int64_t>(size));
+    LOGGER(INFO, "Activation tensor '%s' already exists, reusing", name.c_str());
     return tensor;
   }
 
   auto zero_page = make_shared_page(dev_, ZERO_PAGE_ID);
   activation_ftensors_[name] =
       std::make_unique<ActivationFTensor>(name, size, dtype, dev_, zero_page);
+  LOGGER(WARNING, "Activation tensor '%s' created: VA %zu MB reserved",
+         name.c_str(), size / (1024 * 1024));
   return activation_ftensors_[name]->get_tensor();
 }
 
@@ -385,7 +388,13 @@ bool FTensorAllocator::map_activation(const std::string &name) {
     LOGGER(ERROR, "Activation tensor %s not found", name.c_str());
     return false;
   }
-  return it->second->map_all();
+  bool ok = it->second->map_all();
+  if (ok) {
+    LOGGER(WARNING, "Activation tensor '%s' mapped: %zu pages (%zu MB)",
+           name.c_str(), it->second->size() / kPageSize,
+           it->second->size() / (1024 * 1024));
+  }
+  return ok;
 }
 
 bool FTensorAllocator::unmap_activation(const std::string &name) {
@@ -395,7 +404,14 @@ bool FTensorAllocator::unmap_activation(const std::string &name) {
     LOGGER(ERROR, "Activation tensor %s not found", name.c_str());
     return false;
   }
-  return it->second->unmap_all();
+  bool ok = it->second->unmap_all();
+  if (ok) {
+    LOGGER(WARNING, "Activation tensor '%s' unmapped: %zu pages (%zu MB) "
+           "released",
+           name.c_str(), it->second->size() / kPageSize,
+           it->second->size() / (1024 * 1024));
+  }
+  return ok;
 }
 
 bool FTensorAllocator::has_activation(const std::string &name) const {

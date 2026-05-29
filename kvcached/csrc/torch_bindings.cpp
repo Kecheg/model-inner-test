@@ -184,9 +184,11 @@ torch::Tensor create_activation_tensor(size_t size, const py::object &dtype,
                                        const std::string &dev_str,
                                        const std::string &name,
                                        int64_t group_id = 0) {
+  // Convert dtype FIRST while the GIL is still held (torch_dtype_cast
+  // calls py::module_::import("torch") which needs the GIL).
+  auto dtype_ = kvcached::torch_dtype_cast(dtype);
   py::gil_scoped_release release;
   auto allocator = kvcached::FTensorAllocator::global_allocator(group_id);
-  auto dtype_ = kvcached::torch_dtype_cast(dtype);
   return allocator->create_activation_tensor(size, dtype_, dev_str, name);
 }
 

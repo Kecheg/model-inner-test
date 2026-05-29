@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 BASE_IMAGE="vllm-weight-share:full-sardeenz-kvcached-upstream"
-TAG="vllm-weight-share:kvcached-v2"
+TAG="vllm-weight-share:kvcached-v3"
 DOCKERFILE="docker/Dockerfile.kvcached-v2"
 
 PUSH_CODE=false

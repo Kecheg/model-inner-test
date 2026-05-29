@@ -10,22 +10,21 @@ from kvcached.utils import PAGE_SIZE
 
 
 class TestActivationPoolManager:
-    """Tests for ActivationPoolManager — per-model activation memory lifecycle."""
+    """Per-model activation memory lifecycle tests."""
 
     @pytest.fixture(autouse=True)
     def _ensure_kvcached_initialized(self):
-        """Initialize kvcached VMM for tests that need it."""
         from kvcached import vmm_ops
 
         vmm_ops.init_kvcached("cuda:0", PAGE_SIZE, False)
         yield
         vmm_ops.shutdown_kvcached()
 
-    def test_initialize_creates_tensor(self):
-        """initialize() should create a VA tensor view."""
+    def test_initialize_creates_and_stores_tensor(self):
+        """initialize() creates a VA tensor and stores the reference."""
         from kvcached.activation_pool_manager import ActivationPoolManager
 
-        peak_bytes = 64 * 1024 * 1024  # 64 MB
+        peak_bytes = 64 * 1024 * 1024
         pool = ActivationPoolManager(
             model_name="test_embedding",
             peak_activation_bytes=peak_bytes,
@@ -36,14 +35,17 @@ class TestActivationPoolManager:
 
         assert pool.is_initialized
         assert not pool.is_mapped
+        assert pool.tensor is not None
+        assert pool.tensor.data_ptr() != 0
+        assert pool.tensor.numel() * pool.tensor.element_size() == peak_bytes
 
     def test_begin_end_forward_lifecycle(self):
-        """begin_forward() maps physical pages; end_forward() unmaps them."""
+        """begin_forward() maps; end_forward() unmaps."""
         from kvcached.activation_pool_manager import ActivationPoolManager
 
-        peak_bytes = 64 * 1024 * 1024  # 64 MB
+        peak_bytes = 64 * 1024 * 1024
         pool = ActivationPoolManager(
-            model_name="test_embedding",
+            model_name="test_lifecycle",
             peak_activation_bytes=peak_bytes,
             dtype=torch.float16,
             device="cuda:0",
@@ -57,12 +59,12 @@ class TestActivationPoolManager:
         assert not pool.is_mapped
 
     def test_begin_forward_idempotent(self):
-        """Calling begin_forward() twice should be safe (idempotent)."""
+        """Double begin_forward is safe."""
         from kvcached.activation_pool_manager import ActivationPoolManager
 
         peak_bytes = 64 * 1024 * 1024
         pool = ActivationPoolManager(
-            model_name="test_embedding",
+            model_name="test_idem",
             peak_activation_bytes=peak_bytes,
             dtype=torch.float16,
             device="cuda:0",
@@ -70,68 +72,59 @@ class TestActivationPoolManager:
         pool.initialize()
 
         pool.begin_forward()
-        pool.begin_forward()  # second call should be no-op
+        pool.begin_forward()
         assert pool.is_mapped
 
         pool.end_forward()
 
     def test_end_forward_before_begin(self):
-        """end_forward() before begin_forward() should be safe (no-op)."""
+        """end_forward before begin_forward is a safe no-op."""
         from kvcached.activation_pool_manager import ActivationPoolManager
 
         peak_bytes = 64 * 1024 * 1024
         pool = ActivationPoolManager(
-            model_name="test_embedding",
+            model_name="test_noop",
             peak_activation_bytes=peak_bytes,
             dtype=torch.float16,
             device="cuda:0",
         )
         pool.initialize()
-        pool.end_forward()  # should not raise
+        pool.end_forward()
         assert not pool.is_mapped
 
-    def test_tensor_read_write_after_map(self):
-        """Tensor view should be readable/writable after begin_forward()."""
-        from kvcached import vmm_ops
+    def test_tensor_accessible_while_mapped(self):
+        """VMM tensor is readable/writable after begin_forward."""
         from kvcached.activation_pool_manager import ActivationPoolManager
 
-        peak_bytes = 64 * 1024 * 1024  # 64 MB
-        dtype = torch.float16
+        peak_bytes = 64 * 1024 * 1024
         pool = ActivationPoolManager(
-            model_name="test_readwrite",
+            model_name="test_access",
             peak_activation_bytes=peak_bytes,
-            dtype=dtype,
+            dtype=torch.float16,
             device="cuda:0",
         )
         pool.initialize()
 
         pool.begin_forward()
-
-        # The tensor created by create_activation_tensor can be retrieved
-        # and should be usable for read/write.
-        # NOTE: In practice, the tensor view is managed internally.
-        # This test verifies the C++ round-trip works.
+        # Tensor is physically backed; reading/writing should not fault.
+        _ = pool.tensor[:1024].sum().item()
+        pool.tensor[0] = 1.0
         pool.end_forward()
 
-    def test_physical_memory_release(self):
-        """After end_forward(), GPU physical memory should be released.
-
-        Verifies by checking that the memory can be re-acquired by a
-        subsequent begin_forward() call (which re-allocates pages).
-        """
+    def test_repeated_forward_cycles(self):
+        """Multiple map/unmap cycles succeed."""
         from kvcached.activation_pool_manager import ActivationPoolManager
 
-        peak_bytes = 128 * 1024 * 1024  # 128 MB
+        peak_bytes = 64 * 1024 * 1024
         pool = ActivationPoolManager(
-            model_name="test_mem_release",
+            model_name="test_repeat",
             peak_activation_bytes=peak_bytes,
             dtype=torch.float16,
             device="cuda:0",
         )
         pool.initialize()
 
-        # Map -> unmap -> map again should succeed
-        for _ in range(5):
+        for _ in range(10):
             pool.begin_forward()
             assert pool.is_mapped
             pool.end_forward()
@@ -139,7 +132,7 @@ class TestActivationPoolManager:
 
 
 class TestActivationCoordinator:
-    """Tests for ActivationCoordinator — multi-model pooling management."""
+    """Multi-model coordination tests."""
 
     @pytest.fixture(autouse=True)
     def _ensure_kvcached_initialized(self):
@@ -150,18 +143,14 @@ class TestActivationCoordinator:
         vmm_ops.shutdown_kvcached()
 
     def test_register_multiple_models(self):
-        """Should register and initialize multiple models independently."""
         from kvcached.activation_pool_manager import ActivationCoordinator
 
         coordinator = ActivationCoordinator()
-        models = ["embedding_v1", "rerank_v2", "embedding_multilingual"]
+        models = ["embedding_v1", "rerank_v2", "multilingual"]
 
         for name in models:
             pool = coordinator.register_model(
-                model_name=name,
-                peak_activation_bytes=64 * 1024 * 1024,
-                dtype=torch.float16,
-                device="cuda:0",
+                name, 64 * 1024 * 1024, torch.float16, "cuda:0"
             )
             assert pool.is_initialized
             assert not pool.is_mapped
@@ -170,61 +159,58 @@ class TestActivationCoordinator:
         assert coordinator.total_peak_bytes == len(models) * 64 * 1024 * 1024
 
     def test_independent_forward_cycles(self):
-        """Each model's activation pool should operate independently."""
         from kvcached.activation_pool_manager import ActivationCoordinator
 
         coordinator = ActivationCoordinator()
+        coordinator.register_model("a", 32 * 1024 * 1024, torch.float16, "cuda:0")
+        coordinator.register_model("b", 48 * 1024 * 1024, torch.float16, "cuda:0")
 
-        coordinator.register_model(
-            "model_a", 32 * 1024 * 1024, torch.float16, "cuda:0"
-        )
-        coordinator.register_model(
-            "model_b", 48 * 1024 * 1024, torch.float16, "cuda:0"
-        )
+        coordinator.begin_forward("a")
+        assert coordinator.get_pool("a").is_mapped
+        assert not coordinator.get_pool("b").is_mapped
+        coordinator.end_forward("a")
 
-        # Model A forward
-        coordinator.begin_forward("model_a")
-        assert coordinator.get_pool("model_a").is_mapped
-        assert not coordinator.get_pool("model_b").is_mapped
-        coordinator.end_forward("model_a")
+        coordinator.begin_forward("b")
+        assert not coordinator.get_pool("a").is_mapped
+        assert coordinator.get_pool("b").is_mapped
+        coordinator.end_forward("b")
 
-        # Model B forward
-        coordinator.begin_forward("model_b")
-        assert not coordinator.get_pool("model_a").is_mapped
-        assert coordinator.get_pool("model_b").is_mapped
-        coordinator.end_forward("model_b")
-
-    def test_register_existing_model_returns_same_pool(self):
-        """Registering the same model twice returns the existing pool."""
+    def test_register_existing_returns_same_pool(self):
         from kvcached.activation_pool_manager import ActivationCoordinator
 
         coordinator = ActivationCoordinator()
-        pool1 = coordinator.register_model(
-            "test_model", 32 * 1024 * 1024, torch.float16, "cuda:0"
-        )
-        pool2 = coordinator.register_model(
-            "test_model", 64 * 1024 * 1024, torch.float16, "cuda:0"
-        )
-        assert pool1 is pool2
+        p1 = coordinator.register_model("x", 32 * 1024 * 1024, torch.float16, "cuda:0")
+        p2 = coordinator.register_model("x", 64 * 1024 * 1024, torch.float16, "cuda:0")
+        assert p1 is p2
 
     def test_release_all(self):
-        """release_all() should unmap all models."""
         from kvcached.activation_pool_manager import ActivationCoordinator
 
         coordinator = ActivationCoordinator()
         for name in ["m1", "m2", "m3"]:
-            coordinator.register_model(
-                name, 32 * 1024 * 1024, torch.float16, "cuda:0"
-            )
+            coordinator.register_model(name, 32 * 1024 * 1024, torch.float16, "cuda:0")
             coordinator.begin_forward(name)
 
         coordinator.release_all()
         for name in ["m1", "m2", "m3"]:
             assert not coordinator.get_pool(name).is_mapped
 
+    def test_separate_vmm_ranges(self):
+        from kvcached.activation_pool_manager import ActivationCoordinator
+
+        coordinator = ActivationCoordinator()
+        coordinator.register_model("x", 32 * 1024 * 1024, torch.float16, "cuda:0")
+        coordinator.register_model("y", 64 * 1024 * 1024, torch.float16, "cuda:0")
+
+        px = coordinator.get_pool("x")
+        py = coordinator.get_pool("y")
+        assert px.tensor.data_ptr() != py.tensor.data_ptr()
+        assert px.peak_activation_bytes == 32 * 1024 * 1024
+        assert py.peak_activation_bytes == 64 * 1024 * 1024
+
 
 class TestActivationPageAlignment:
-    """Tests for page-size alignment in ActivationCoordinator."""
+    """Page-alignment tests."""
 
     @pytest.fixture(autouse=True)
     def _ensure_kvcached_initialized(self):
@@ -234,17 +220,13 @@ class TestActivationPageAlignment:
         yield
         vmm_ops.shutdown_kvcached()
 
-    def test_unaligned_peak_bytes_are_aligned(self):
-        """Peak bytes that are not page-aligned should be aligned up."""
+    def test_unaligned_rounded_up(self):
         from kvcached.activation_pool_manager import ActivationCoordinator
 
-        unaligned = PAGE_SIZE + 1024  # slightly over one page
+        unaligned = PAGE_SIZE + 1024
         coordinator = ActivationCoordinator()
-        pool = coordinator.register_model(
-            "test_align", unaligned, torch.float16, "cuda:0"
-        )
+        pool = coordinator.register_model("align", unaligned, torch.float16, "cuda:0")
 
-        # Should have been aligned up to the next page boundary
         expected = (unaligned + PAGE_SIZE - 1) // PAGE_SIZE * PAGE_SIZE
         assert pool.peak_activation_bytes == expected
         assert pool.peak_activation_bytes % PAGE_SIZE == 0
