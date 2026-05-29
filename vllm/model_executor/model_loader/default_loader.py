@@ -451,7 +451,7 @@ def _get_phase2_shareable_names(model) -> set[str]:
     from vllm.distributed.weight_sharing.parameter_filter import (
         get_shareable_param_names,
     )
-    return get_shareable_param_names(model)
+    return get_shareable_param_names(model, ws)
 
 
 def _shrink_shareable_params(model, shareable_names: set[str]) -> None:

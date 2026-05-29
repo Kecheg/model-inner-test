@@ -28,10 +28,14 @@ COPY vllm/model_executor/model_loader/default_loader.py /tmp/ws/model_executor/m
 COPY vllm/model_executor/model_loader/utils.py /tmp/ws/model_executor/model_loader/utils.py
 COPY vllm/v1/worker/gpu_model_runner.py /tmp/ws/v1/worker/gpu_model_runner.py
 COPY vllm/v1/worker/gpu_worker.py /tmp/ws/v1/worker/gpu_worker.py
+COPY vllm/entrypoints/cli/main.py /tmp/ws/entrypoints/cli/main.py
+COPY vllm/entrypoints/cli/export_multi_weights.py /tmp/ws/entrypoints/cli/export_multi_weights.py
+COPY vllm/entrypoints/cli/export_weights.py /tmp/ws/entrypoints/cli/export_weights.py
+COPY vllm/weight_exporter.py /tmp/ws/weight_exporter.py
 COPY kvcached/ /opt/kvcached/
 
 RUN SITE=$(python3 -c "import vllm,os;print(os.path.dirname(vllm.__file__))") \
-    && mkdir -p "$SITE/distributed/weight_sharing" \
+    && mkdir -p "$SITE/distributed/weight_sharing" "$SITE/entrypoints/cli" \
     && cp /tmp/ws/config/weight_sharing.py "$SITE/config/weight_sharing.py" \
     && cp /tmp/ws/config/vllm.py "$SITE/config/vllm.py" \
     && cp /tmp/ws/config/__init__.py "$SITE/config/__init__.py" \
@@ -42,6 +46,10 @@ RUN SITE=$(python3 -c "import vllm,os;print(os.path.dirname(vllm.__file__))") \
     && cp /tmp/ws/v1/worker/gpu_model_runner.py "$SITE/v1/worker/gpu_model_runner.py" \
     && cp /tmp/ws/v1/worker/gpu_worker.py "$SITE/v1/worker/gpu_worker.py" \
     && cp /tmp/ws/distributed/weight_sharing/*.py "$SITE/distributed/weight_sharing/" \
+    && cp /tmp/ws/entrypoints/cli/main.py "$SITE/entrypoints/cli/main.py" \
+    && cp /tmp/ws/entrypoints/cli/export_multi_weights.py "$SITE/entrypoints/cli/export_multi_weights.py" \
+    && cp /tmp/ws/entrypoints/cli/export_weights.py "$SITE/entrypoints/cli/export_weights.py" \
+    && cp /tmp/ws/weight_exporter.py "$SITE/weight_exporter.py" \
     && rm -rf /tmp/ws \
     && python3 -m pip install --progress-bar off --no-cache-dir "wrapt>=1.15" "posix_ipc>=1.0" \
     && python3 -c "from pathlib import Path; p=Path('/opt/kvcached/setup.py'); s=p.read_text(); s=s.replace('{\"build_ext\": BuildExtension}', '{\"build_ext\": BuildExtension.with_options(use_ninja=False)}'); p.write_text(s)" \
