@@ -198,6 +198,17 @@ def _infer_attention_type(kv_cache_config: Any) -> str:
     return "MHA"
 
 
+def _should_bypass_kvcached_for_kv_config(kv_cache_config: Any) -> bool:
+    """Return whether this KV config should stay on native vLLM.
+
+    kvcached's HYBRID_LINEAR path is not safe for models that mix full
+    attention and Mamba/linear state groups: it can start successfully but
+    produce corrupted generations. Prefer a native fallback over silent bad
+    output until the hybrid layout and block-table semantics are fully covered.
+    """
+    return _infer_attention_type(kv_cache_config) == "HYBRID_LINEAR"
+
+
 def _should_enable_async_sched(vllm_config: Any) -> bool:
     """Enable kvcached async scheduling whenever vLLM async scheduling is on."""
     if vllm_config is None:
@@ -790,6 +801,13 @@ class KVCacheCoordinatorPatch(VersionAwarePatch, BasePatch):
             block_size = kv_cache_spec.block_size
 
             attention_type = _infer_attention_type(kv_cache_config)
+            if _should_bypass_kvcached_for_kv_config(kv_cache_config):
+                logger.warning(
+                    "kvcached bypassed for HYBRID_LINEAR KV cache config. "
+                    "This model mixes attention and Mamba/linear-state KV "
+                    "groups, which is not safe to manage with kvcached yet."
+                )
+                return
 
             cell_size, num_kv_buffers = _get_kv_cache_params(
                 kv_cache_spec, block_size, attention_type=attention_type)
@@ -1216,13 +1234,6 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
                 set_kv_cache_layout(selected_layout)
 
-            kv_cache_shape = attn_backend_cls.get_kv_cache_shape(
-                num_blocks,
-                kv_cache_spec.block_size,
-                kv_cache_spec.num_kv_heads,
-                kv_cache_spec.head_size,
-            )
-
             # Allocate group_size shared VM-backed pools, mirroring vLLM's
             # KVCacheTensor sharing: pool i is shared by layer i from each
             # group, and different groups use different block IDs within the
@@ -1275,6 +1286,14 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
                     "produce invalid KV cache strides."
                 )
 
+            kv_cache_shape = attn_backend_cls.get_kv_cache_shape(
+                num_blocks,
+                kv_cache_spec.block_size,
+                kv_cache_spec.num_kv_heads,
+                kv_cache_spec.head_size,
+                cache_dtype_str=getattr(self.cache_config, "cache_dtype", "auto"),
+            )
+
             alloc_result = kvi.alloc_kv_cache(
                 kv_cache_shape,
                 kv_cache_spec.block_size,
@@ -1312,7 +1331,11 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         def _patched_alloc_kv(self, kv_cache_config, *args: Any, **kwargs: Any):
             # Pooling models use EncoderOnlyAttentionSpec and have no
             # generative KV cache to manage; let vLLM handle natively.
-            if enable_kvcached() and not getattr(self, "is_pooling_model", False):
+            if (
+                enable_kvcached()
+                and not getattr(self, "is_pooling_model", False)
+                and not _should_bypass_kvcached_for_kv_config(kv_cache_config)
+            ):
                 return self._allocate_kv_cache_from_kvcached(kv_cache_config)
             return original_method(self, kv_cache_config, *args, **kwargs)
 
@@ -1377,7 +1400,11 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
         original_method = getattr(GPUModelRunner, "_reshape_kv_cache_tensors")
 
         def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any):
-            if enable_kvcached() and not getattr(self, "is_pooling_model", False):
+            if (
+                enable_kvcached()
+                and not getattr(self, "is_pooling_model", False)
+                and not _should_bypass_kvcached_for_kv_config(kv_cache_config)
+            ):
                 return self._reshape_kv_cache_tensors_from_kvcached(
                     kv_cache_config, kv_cache_raw_tensors, *args, **kwargs
                 )

@@ -76,6 +76,9 @@ RUN test -f /app/apps/backend/dist/server.js \
 ENV ENABLE_KVCACHED=true \
     KVCACHED_AUTOPATCH=1 \
     KVCACHED_KVCTL_BIN=/usr/local/bin/kvctl \
+    KV_ADMISSION_ENABLED=true \
+    KV_ADMISSION_MAX_INSTANCE_INFLIGHT=32 \
+    KV_ADMISSION_MAX_GPU_GROUP_INFLIGHT=64 \
     LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libcuda.so.1
 
 WORKDIR /app

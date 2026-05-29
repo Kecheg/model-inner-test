@@ -437,6 +437,7 @@ class DefaultModelLoader(BaseModelLoader):
         # After import, every shareable quantized layer now has correctly
         # shaped weights on CUDA.  Ensure Marlin workspace is allocated.
         _ensure_workspace(model)
+        _ensure_weight_sharing_secondary_moe_kernels(model)
 
 
 def _get_phase2_shareable_names(model) -> set[str]:
@@ -570,3 +571,66 @@ def _ensure_workspace(model) -> None:
             module.input_scale = None
         if quant_method is not None and not hasattr(module, "workspace"):
             module.workspace = marlin_make_workspace_new(cuda_dev, max_blocks_per_sm=4)
+
+
+def _ensure_weight_sharing_secondary_moe_kernels(model) -> None:
+    """Initialize FP8 MoE runtime kernels after IPC weight import.
+
+    Secondary weight-sharing instances import already-processed expert weights
+    from the primary.  Re-entering process_weights_after_loading would repack
+    those tensors again, while prepare_communication_buffer_for_model enters an
+    incompatible legacy MoE path.  Build only the runtime kernel object that
+    FP8 MoE forward expects.
+    """
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+        make_fp8_moe_kernel,
+    )
+
+    initialized = 0
+    skipped = 0
+    for _, module in model.named_modules():
+        if module.__class__.__name__ not in ("FusedMoE", "SharedFusedMoE"):
+            continue
+
+        quant_method = getattr(module, "quant_method", None)
+        if (
+            quant_method is None
+            or getattr(quant_method, "moe_kernel", None) is not None
+        ):
+            continue
+        if not all(
+            hasattr(quant_method, attr)
+            for attr in ("get_fused_moe_quant_config", "moe", "fp8_backend")
+        ):
+            skipped += 1
+            continue
+
+        experts_cls = getattr(quant_method, "experts_cls", None)
+        if experts_cls is None:
+            skipped += 1
+            continue
+
+        moe_quant_config = quant_method.get_fused_moe_quant_config(module)
+        if moe_quant_config is None:
+            skipped += 1
+            continue
+
+        routing_tables = module._maybe_init_expert_routing_tables()
+        quant_method.moe_quant_config = moe_quant_config
+        quant_method.moe_kernel = make_fp8_moe_kernel(
+            moe_quant_config=moe_quant_config,
+            moe_config=quant_method.moe,
+            fp8_backend=quant_method.fp8_backend,
+            experts_cls=experts_cls,
+            routing_tables=routing_tables,
+            shared_experts=module.shared_experts,
+        )
+        initialized += 1
+
+    if initialized or skipped:
+        logger.info(
+            "WeightSharing: initialized %d secondary FP8 MoE kernels "
+            "after IPC import; skipped %d modules.",
+            initialized,
+            skipped,
+        )
