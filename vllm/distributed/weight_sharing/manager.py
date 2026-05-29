@@ -39,8 +39,8 @@ from torch.multiprocessing.reductions import reduce_tensor  # 核心 API：创�
 from vllm.config import get_current_vllm_config
 from vllm.config.weight_sharing import WeightSharingConfig
 from vllm.distributed.weight_sharing.parameter_filter import (
+    filter_shareable_param_names,
     get_shareable_param_names,        # 获取可共享参数名称集合
-    is_shareable_parameter,
 )
 from vllm.distributed.weight_sharing.registry import WeightSharingRegistry
 from vllm.logger import init_logger
@@ -99,7 +99,7 @@ class WeightSharingManager:
             raise RuntimeError(
                 "export_weights() 只能在 'primary' 模式下调用。")
 
-        shareable_names = get_shareable_param_names(model)
+        shareable_names = get_shareable_param_names(model, self._config)
         _log_special_weight_sharing_summary(model, shareable_names, "primary")
         if not shareable_names:
             logger.warning("WeightSharing: 没有找到可共享的参数。")
@@ -176,7 +176,12 @@ class WeightSharingManager:
                 "请确认 primary 已先启动且注册表目录可访问。")
 
         registry_data = self._registry.read_registry()
-        weights_data: dict[str, dict] = registry_data.get("weights", {})
+        registry_weights: dict[str, dict] = registry_data.get("weights", {})
+        weights_data = {
+            name: registry_weights[name]
+            for name in filter_shareable_param_names(
+                registry_weights.keys(), self._config)
+        }
 
         # 从注册表数据中找到对应 device_index 的 GPU UUID，
         # 直接从 primary 导出的数据中取第一个匹配的 UUID
@@ -273,7 +278,19 @@ class WeightSharingManager:
 
         # ====== 开始导入 ======
 
-        weights_data: dict[str, dict] = registry_data.get("weights", {})
+        registry_weights: dict[str, dict] = registry_data.get("weights", {})
+        expected_names = get_shareable_param_names(model, self._config)
+        missing_expected = expected_names - set(registry_weights)
+        if missing_expected:
+            raise RuntimeError(
+                "WeightSharing: primary 未导出 secondary 配置要求共享的参数。"
+                f"缺失 {len(missing_expected)} 个，examples="
+                f"{sorted(missing_expected)[:10]}。请确保 primary 共享集合是 "
+                "secondary 共享集合的超集。")
+        weights_data = {
+            name: registry_weights[name]
+            for name in expected_names
+        }
         _log_special_weight_sharing_summary(
             model, set(weights_data.keys()), "secondary")
         device_index = torch.cuda.current_device()
@@ -320,7 +337,7 @@ class WeightSharingManager:
             missing = len(weights_data) - len(imported)
             raise RuntimeError(
                 f"WeightSharing: 只导入 {len(imported)}/{len(weights_data)} "
-                f"共享参数（{missing} 个缺失），无法使用不完整的参数运行。")
+                f"secondary 配置要求的共享参数（{missing} 个缺失），无法运行。")
 
         # 释放 PyTorch CUDA 缓存
         torch.cuda.empty_cache()
@@ -445,11 +462,20 @@ class WeightSharingManager:
                 serialized)
             func, args = ipc_handle
             list_args = list(args)
-            # index 6 是 torch IPC handle 中的 device_index 位置
+            # index 6 is the CUDA storage device used by PyTorch's
+            # CUDA IPC rebuild path. PyTorch 2.10 still expects an int here.
             list_args[6] = device_index
+            torch.cuda.set_device(device_index)
+            torch.cuda._lazy_init()
+            logger.info(
+                "WeightSharing: rebuild IPC tensor %s on cuda:%d "
+                "(current=%d, visible_devices=%d, storage_device_arg=%r)",
+                name, device_index, torch.cuda.current_device(),
+                torch.cuda.device_count(), list_args[6])
             # ★ 核心：重建 tensor，直接指向 primary 的 GPU 物理内存。
-            # 调用方必须在进入 pre_open_handles 前完成本 rank 的 CUDA
-            # device 绑定，这里只负责按传入 device_index patch IPC args。
+            # 重建 IPC tensor 时必须确保当前 CUDA device 与 handle 的
+            # device_index 一致，否则 secondary 在单卡/TP 场景都可能把
+            # handle 打开到错误上下文。
             return func(*list_args)
         except Exception as exc:
             logger.error(
@@ -524,8 +550,7 @@ def _log_special_weight_sharing_summary(
                 role, group_name)
             continue
         total_bytes = sum(_tensor_nbytes(param.data) for _, param in items)
-        shared = any(name in shared_names or is_shareable_parameter(name)
-                     for name, _ in items)
+        shared = any(name in shared_names for name, _ in items)
         logger.info(
             "WeightSharing %s: %s shared=%s params=%d size=%.3f GiB names=%s",
             role, group_name, shared, len(items), total_bytes / 1024**3,
@@ -557,20 +582,23 @@ def _dtype_from_string(dtype: str) -> torch.dtype:
 def _compute_model_hash(model: torch.nn.Module) -> str:
     """计算模型架构 hash，用于 secondary 校验 primary 是否兼容。
 
-    使用模型路径 + 模型 config（architecture + hidden_size + num_layers）。
-    确保 PP 各 rank 和 primary/secondary 之间 hash 一致。
+    使用模型路径 + 总参数数量 + dtype 计算 hash。
+    模型路径在所有 PP/TP rank 间一致，参数数量和 dtype 提供额外校验。
+    不使用具体参数名（不同 PP stage 的参数名不同）。
     """
     h = hashlib.sha256()
     try:
         cfg = get_current_vllm_config()
         model_path = cfg.model_config.model
-        hf = cfg.model_config.hf_config
-        arch = getattr(hf, "architectures", ["unknown"])[0]
-        hidden = getattr(hf, "hidden_size", 0)
-        layers = getattr(hf, "num_hidden_layers", 0)
-        h.update(f"{model_path}|{arch}|h{hidden}|l{layers}".encode())
     except Exception:
-        h.update(b"unknown")
+        model_path = "unknown"
+    h.update(model_path.encode())
+    params = dict(model.named_parameters())
+    h.update(str(len(params)).encode())            # 总参数数
+    if params:
+        # 取第一个参数的 dtype 作为模型整体 dtype 的近似校验
+        first_p = next(iter(params.values()))
+        h.update(str(first_p.data.dtype).encode())
     return h.hexdigest()[:16]
 
 

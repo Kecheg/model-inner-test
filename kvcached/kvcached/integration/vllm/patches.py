@@ -7,6 +7,9 @@ vLLM-specific patches using unified patch infrastructure.
 
 from __future__ import annotations
 
+import os
+import threading
+import time
 import types
 from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
@@ -17,6 +20,44 @@ from kvcached.activation_pool_manager import is_activation_pool_enabled
 from kvcached.integration.patch_base import BasePatch, enable_kvcached
 from kvcached.integration.version_utils import VersionAwarePatch, VersionRange, version_range
 from kvcached.utils import PAGE_SIZE, get_kvcached_logger
+
+_hotpath_logger = get_kvcached_logger()
+_hotpath_profile_enabled = os.getenv("KVCACHED_PROFILE_HOTPATH", "").lower() in (
+    "1", "true", "yes")
+_hotpath_profile_interval = float(os.getenv("KVCACHED_PROFILE_INTERVAL_SEC", "10"))
+_hotpath_profile_lock = threading.Lock()
+_hotpath_profile_last_log = time.monotonic()
+_hotpath_profile_stats: dict[str, dict[str, float]] = {}
+
+
+def _profile_hotpath(op: str, elapsed_sec: float, items: int = 0) -> None:
+    if not _hotpath_profile_enabled:
+        return
+
+    global _hotpath_profile_last_log
+    now = time.monotonic()
+    with _hotpath_profile_lock:
+        stat = _hotpath_profile_stats.setdefault(
+            op, {"count": 0.0, "total": 0.0, "max": 0.0, "items": 0.0})
+        stat["count"] += 1
+        stat["total"] += elapsed_sec
+        stat["max"] = max(stat["max"], elapsed_sec)
+        stat["items"] += items
+
+        if now - _hotpath_profile_last_log < _hotpath_profile_interval:
+            return
+
+        parts = []
+        for name, value in sorted(_hotpath_profile_stats.items()):
+            count = max(value["count"], 1.0)
+            parts.append(
+                f"{name}: count={int(value['count'])} "
+                f"avg={value['total'] / count * 1000:.3f}ms "
+                f"max={value['max'] * 1000:.3f}ms "
+                f"items={int(value['items'])}")
+        _hotpath_logger.info("KVCACHED_VLLM_PROFILE %s", " | ".join(parts))
+        _hotpath_profile_stats.clear()
+        _hotpath_profile_last_log = now
 
 if TYPE_CHECKING:
     # These types are imported from vLLM at runtime via getattr()
@@ -395,6 +436,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 *args: Any,
                 **kwargs: Any,
             ) -> None:
+                start = time.perf_counter()
                 if not self.enable_prefix_cache:
                     return
 
@@ -458,6 +500,9 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
 
                     self._cached_blocks[key] = block
                     self._block_id_to_key[block.block_id] = key
+                _profile_hotpath("block_pool.cache_full_blocks",
+                                 time.perf_counter() - start,
+                                 max(0, num_full_blocks - num_cached_blocks))
 
             def _evict_blocks_from_pool(self, num_to_evict: int) -> int:
                 """Evict oldest blocks from evictable pool, free to kvcached.
@@ -478,6 +523,7 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
             def get_new_blocks(
                 self, num_blocks: int
             ) -> list[KVCacheBlock]:
+                start = time.perf_counter()
                 if num_blocks > self.get_num_free_blocks():
                     raise ValueError(
                         f"Cannot get {num_blocks} free blocks from the pool")
@@ -496,6 +542,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     block = self.kv_block_pool[bid]
                     block.ref_cnt = 1
                     blocks.append(block)
+                _profile_hotpath("block_pool.get_new_blocks",
+                                 time.perf_counter() - start, num_blocks)
                 return blocks
 
             def touch(
@@ -518,6 +566,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 self,
                 ordered_blocks: Iterable[KVCacheBlock],
             ) -> None:
+                start = time.perf_counter()
+                num_seen = 0
                 if not self.enable_prefix_cache:
                     block_ids = [
                         block.block_id
@@ -526,10 +576,14 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                     ]
                     if block_ids:
                         self.kv_cache_manager.free(block_ids)
+                    _profile_hotpath("block_pool.free_blocks",
+                                     time.perf_counter() - start,
+                                     len(block_ids))
                     return
 
                 uncached_to_free: list[int] = []
                 for block in ordered_blocks:
+                    num_seen += 1
                     if block is None or getattr(block, "is_null", False):
                         continue
                     block.ref_cnt -= 1
@@ -547,6 +601,8 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                         and len(self._evictable_blocks) > self.max_cached_blocks):
                     excess = len(self._evictable_blocks) - self.max_cached_blocks
                     self._evict_blocks_from_pool(excess)
+                _profile_hotpath("block_pool.free_blocks",
+                                 time.perf_counter() - start, num_seen)
 
 
             def evict_blocks(self, block_ids: set[int]) -> None:
@@ -585,7 +641,11 @@ class ElasticBlockPoolPatch(VersionAwarePatch, BasePatch):
                 return True
 
             def get_num_free_blocks(self) -> int:
-                return (self.kv_cache_manager.available_size() + len(self._evictable_blocks)) if self.enable_prefix_cache else self.kv_cache_manager.available_size()
+                start = time.perf_counter()
+                ret = (self.kv_cache_manager.available_size() + len(self._evictable_blocks)) if self.enable_prefix_cache else self.kv_cache_manager.available_size()
+                _profile_hotpath("block_pool.get_num_free_blocks",
+                                 time.perf_counter() - start, ret)
+                return ret
 
             def get_usage(self) -> float:
                 return 1.0 - (self.get_num_free_blocks() / self.num_gpu_blocks)

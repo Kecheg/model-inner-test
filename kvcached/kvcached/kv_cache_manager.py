@@ -49,6 +49,43 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value in ("1", "true", "TRUE", "yes", "YES")
 
 
+HOTPATH_PROFILE_ENABLED = _env_bool("KVCACHED_PROFILE_HOTPATH")
+HOTPATH_PROFILE_INTERVAL = float(os.getenv("KVCACHED_PROFILE_INTERVAL_SEC", "10"))
+_hotpath_profile_lock = threading.Lock()
+_hotpath_profile_last_log = time.monotonic()
+_hotpath_profile_stats: Dict[str, Dict[str, float]] = {}
+
+
+def _profile_hotpath(op: str, elapsed_sec: float, items: int = 0) -> None:
+    if not HOTPATH_PROFILE_ENABLED:
+        return
+
+    global _hotpath_profile_last_log
+    now = time.monotonic()
+    with _hotpath_profile_lock:
+        stat = _hotpath_profile_stats.setdefault(
+            op, {"count": 0.0, "total": 0.0, "max": 0.0, "items": 0.0})
+        stat["count"] += 1
+        stat["total"] += elapsed_sec
+        stat["max"] = max(stat["max"], elapsed_sec)
+        stat["items"] += items
+
+        if now - _hotpath_profile_last_log < HOTPATH_PROFILE_INTERVAL:
+            return
+
+        parts = []
+        for name, value in sorted(_hotpath_profile_stats.items()):
+            count = max(value["count"], 1.0)
+            parts.append(
+                f"{name}: count={int(value['count'])} "
+                f"avg={value['total'] / count * 1000:.3f}ms "
+                f"max={value['max'] * 1000:.3f}ms "
+                f"items={int(value['items'])}")
+        logger.info("KVCACHED_HOTPATH_PROFILE %s", " | ".join(parts))
+        _hotpath_profile_stats.clear()
+        _hotpath_profile_last_log = now
+
+
 def synchronized(method):
     """
     A helper decorator to synchronize access to a method.
@@ -250,7 +287,11 @@ class KVCacheManager:
 
 
     def alloc(self, need_size: int) -> Optional[List[int]]:
-        return self._alloc(need_size)
+        start = time.perf_counter()
+        ret = self._alloc(need_size)
+        _profile_hotpath("manager.alloc", time.perf_counter() - start,
+                         0 if ret is None else len(ret))
+        return ret
 
     @synchronized
     def _alloc(self,
@@ -314,6 +355,7 @@ class KVCacheManager:
 
     @synchronized
     def free(self, indices: List[int]):
+        start = time.perf_counter()
         self._wait_post_init()
 
         if len(indices) == 0:
@@ -367,6 +409,8 @@ class KVCacheManager:
                                            self.block_mem_size)
                 self.in_shrink = False
                 self.target_num_blocks = None
+        _profile_hotpath("manager.free", time.perf_counter() - start,
+                         len(indices))
 
     @synchronized
     def try_to_reserve(self, need_size: int) -> bool:
@@ -419,6 +463,7 @@ class KVCacheManager:
 
     @synchronized
     def available_size(self) -> int:
+        start = time.perf_counter()
         avail_blocks = self.num_avail_blocks + len(self.reserved_blocks)
         if self.in_shrink:
             blocks_from_free_pages = 0
@@ -432,7 +477,10 @@ class KVCacheManager:
                 free_pages = min(virtual_free_pages, physical_free_pages)
             blocks_from_free_pages = free_pages * InternalPage.get_num_blocks(
                 self.page_size, self.block_mem_size)
-        return avail_blocks + blocks_from_free_pages
+        ret = avail_blocks + blocks_from_free_pages
+        _profile_hotpath("manager.available_size",
+                         time.perf_counter() - start, ret)
+        return ret
 
     @synchronized
     def get_mapped_memory_size(self, unit='bytes') -> float:

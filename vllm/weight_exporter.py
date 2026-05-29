@@ -185,6 +185,158 @@ def run_weight_export_service(
         service.shutdown()
 
 
+class MultiWeightExportService:
+    """Export multiple models from one TP/PP primary process group.
+
+    Each rank process initializes CUDA/distributed context once, then loads and
+    exports every configured model's local TP/PP shard.  Keeping all model
+    objects and managers alive in this service keeps all CUDA IPC handles valid.
+    """
+
+    def __init__(
+        self,
+        vllm_configs: list[VllmConfig],
+        *,
+        rank: int = 0,
+        local_rank: int = 0,
+        distributed_init_method: str | None = None,
+    ) -> None:
+        if not vllm_configs:
+            raise ValueError("export-multi-weights requires at least one model.")
+        self.vllm_configs = vllm_configs
+        self.rank = rank
+        self.local_rank = local_rank
+        self.distributed_init_method = distributed_init_method
+        self.models: list[nn.Module] = []
+        self.managers: list[WeightSharingManager] = []
+        self.distributed_initialized = False
+        self.shutdown_requested = False
+
+    @torch.inference_mode()
+    def start(self) -> list[WeightExportResult]:
+        first_config = self.vllm_configs[0]
+        device = init_device_context(first_config, self.local_rank)
+
+        dist_init_required = any(
+            requires_distributed_context(config)
+            or (config.weight_sharing_config is not None
+                and config.weight_sharing_config.mode == "primary")
+            for config in self.vllm_configs)
+        if dist_init_required:
+            dist_method = self.distributed_init_method or "env://"
+            _ensure_distributed_env()
+            with set_current_vllm_config(first_config):
+                init_distributed_context(
+                    first_config,
+                    self.rank,
+                    self.local_rank,
+                    dist_method,
+                )
+            self.distributed_initialized = True
+
+        results: list[WeightExportResult] = []
+        for index, vllm_config in enumerate(self.vllm_configs):
+            ws_config = vllm_config.weight_sharing_config
+            if ws_config is None or ws_config.mode != "primary":
+                raise ValueError(
+                    "export-multi-weights requires every model config to use "
+                    "weight_sharing_config.mode='primary'.")
+
+            start = time.perf_counter()
+            logger.info(
+                "Multi weight export: loading model %d/%d: %s",
+                index + 1,
+                len(self.vllm_configs),
+                vllm_config.model_config.model,
+            )
+            with set_current_vllm_config(vllm_config):
+                model = get_model(vllm_config=vllm_config)
+                manager = WeightSharingManager(ws_config)
+                manager.export_weights(model)
+                torch.accelerator.synchronize(device)
+                torch.accelerator.empty_cache()
+
+            self.models.append(model)
+            self.managers.append(manager)
+            result = WeightExportResult(
+                rank=self.rank,
+                local_rank=self.local_rank,
+                device=str(device),
+                model=vllm_config.model_config.model,
+                load_format=str(vllm_config.load_config.load_format),
+                dtype=str(vllm_config.model_config.dtype),
+                parameter_count=_parameter_count(model),
+                elapsed_seconds=time.perf_counter() - start,
+                memory_allocated_bytes=_memory_allocated(device),
+                memory_reserved_bytes=_memory_reserved(device),
+            )
+            _log_result(result)
+            results.append(result)
+
+        logger.info(
+            "Multi weight export complete: rank=%d local_rank=%d models=%d "
+            "allocated=%s reserved=%s",
+            self.rank,
+            self.local_rank,
+            len(results),
+            format_gib(_memory_allocated(device)),
+            format_gib(_memory_reserved(device)),
+        )
+        return results
+
+    def wait_forever(self) -> None:
+        logger.info(
+            "Multi weight export service is ready. Keeping primary weights alive."
+        )
+        while not self.shutdown_requested:
+            time.sleep(1)
+
+    def request_shutdown(self, signum: int | None = None) -> None:
+        if signum is not None:
+            logger.info("Received signal %d, shutting down multi weight export service.", signum)
+        self.shutdown_requested = True
+
+    def shutdown(self) -> None:
+        for manager in reversed(self.managers):
+            manager.cleanup()
+        self.managers.clear()
+        self.models.clear()
+        gc.collect()
+        torch.accelerator.empty_cache()
+        if self.distributed_initialized:
+            cleanup_dist_env_and_memory()
+            self.distributed_initialized = False
+
+
+def run_multi_weight_export_service(
+    vllm_configs: list[VllmConfig],
+    *,
+    rank: int = 0,
+    local_rank: int = 0,
+    distributed_init_method: str | None = None,
+) -> list[WeightExportResult]:
+    service = MultiWeightExportService(
+        vllm_configs,
+        rank=rank,
+        local_rank=local_rank,
+        distributed_init_method=distributed_init_method,
+    )
+
+    def signal_handler(signum, frame):
+        service.request_shutdown(signum)
+
+    old_sigterm = signal.signal(signal.SIGTERM, signal_handler)
+    old_sigint = signal.signal(signal.SIGINT, signal_handler)
+    try:
+        results = service.start()
+        service.wait_forever()
+        return results
+    finally:
+        signal.signal(signal.SIGTERM, old_sigterm)
+        signal.signal(signal.SIGINT, old_sigint)
+        service.shutdown()
+
+
 def _parameter_count(model: nn.Module) -> int:
     return sum(param.numel() for param in model.parameters())
 

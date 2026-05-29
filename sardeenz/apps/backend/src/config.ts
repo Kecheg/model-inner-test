@@ -216,7 +216,7 @@ export const config: Config = {
     1024
   ),
   kvcachedKvctlBin: getEnv('KVCACHED_KVCTL_BIN', 'kvctl'),
-  kvcachedDisablePrefixCaching: getEnvBool('KVCACHED_DISABLE_PREFIX_CACHING', true),
+  kvcachedDisablePrefixCaching: getEnvBool('KVCACHED_DISABLE_PREFIX_CACHING', false),
 
   // KV admission control. Disabled by default so existing behavior is unchanged
   // until explicitly enabled for second-stage validation.

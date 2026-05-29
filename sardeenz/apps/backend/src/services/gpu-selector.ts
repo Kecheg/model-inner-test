@@ -48,9 +48,9 @@ export class GpuSelector {
 
   /**
    * Get recommended GPU(s) for a new model based on free memory.
-   * For tensor parallel, returns the starting GPU index of contiguous GPUs with most combined free memory.
+   * For multi-GPU execution, returns the starting GPU index of contiguous GPUs with most combined free memory.
    */
-  async getRecommendedGpu(tensorParallelSize: number = 1): Promise<GpuRecommendation> {
+  async getRecommendedGpu(requiredGpuCount: number = 1): Promise<GpuRecommendation> {
     const nvidiaSmi = await getNvidiaSmiInfo()
     const gpus = nvidiaSmi.gpus
 
@@ -58,7 +58,7 @@ export class GpuSelector {
       throw new Error('No GPUs detected')
     }
 
-    if (tensorParallelSize === 1) {
+    if (requiredGpuCount === 1) {
       // Single GPU: select one with most free memory
       const sorted = [...gpus].sort(
         (a, b) => b.memoryTotalMB - b.memoryUsedMB - (a.memoryTotalMB - a.memoryUsedMB)
@@ -73,10 +73,10 @@ export class GpuSelector {
       }
     }
 
-    // Tensor parallel: find contiguous GPUs with most combined free memory
-    if (tensorParallelSize > gpus.length) {
+    // Multi-GPU execution: find contiguous GPUs with most combined free memory
+    if (requiredGpuCount > gpus.length) {
       throw new Error(
-        `Requested tensor_parallel_size=${tensorParallelSize} but only ${gpus.length} GPUs available`
+        `Requested ${requiredGpuCount} execution GPU(s) but only ${gpus.length} GPU(s) available`
       )
     }
 
@@ -86,9 +86,9 @@ export class GpuSelector {
     let bestStart = 0
     let bestFreeTotal = 0
 
-    for (let start = 0; start <= sortedByIndex.length - tensorParallelSize; start++) {
+    for (let start = 0; start <= sortedByIndex.length - requiredGpuCount; start++) {
       let freeTotal = 0
-      for (let i = start; i < start + tensorParallelSize; i++) {
+      for (let i = start; i < start + requiredGpuCount; i++) {
         const gpu = sortedByIndex[i]
         freeTotal += gpu.memoryTotalMB - gpu.memoryUsedMB
       }
@@ -99,7 +99,7 @@ export class GpuSelector {
     }
 
     const startGpuIndex = sortedByIndex[bestStart].index
-    const endGpuIndex = sortedByIndex[bestStart + tensorParallelSize - 1].index
+    const endGpuIndex = sortedByIndex[bestStart + requiredGpuCount - 1].index
 
     return {
       gpu_id: startGpuIndex,
@@ -109,11 +109,11 @@ export class GpuSelector {
   }
 
   /**
-   * Validate that requested GPUs exist and are valid for the given tensor parallel size.
+   * Validate that requested GPUs exist and are valid for the required execution GPU count.
    */
   async validateGpuSelection(
     gpuIds: number[],
-    tensorParallelSize?: number
+    requiredGpuCount?: number
   ): Promise<GpuValidationResult> {
     let validatedGpuIds: number[]
     try {
@@ -126,20 +126,19 @@ export class GpuSelector {
       }
     }
 
-    // For tensor parallel, verify we have enough GPUs
-    const effectiveTPSize = tensorParallelSize ?? 1
-    if (effectiveTPSize > 1 && effectiveTPSize > validatedGpuIds.length) {
+    const effectiveRequiredGpuCount = requiredGpuCount ?? 1
+    if (effectiveRequiredGpuCount > 1 && effectiveRequiredGpuCount > validatedGpuIds.length) {
       return {
         valid: false,
-        error: `tensor_parallel_size=${effectiveTPSize} requires ${effectiveTPSize} GPUs but only ${validatedGpuIds.length} selected`,
+        error: `Execution requires ${effectiveRequiredGpuCount} GPU(s) but only ${validatedGpuIds.length} selected`,
         gpuIds: [],
       }
     }
 
-    // For tensor parallel with more GPUs selected than needed, use only the first N
+    // With more GPUs selected than needed, use only the first N
     const effectiveGpuIds =
-      effectiveTPSize > 1
-        ? validatedGpuIds.slice(0, effectiveTPSize)
+      effectiveRequiredGpuCount > 1
+        ? validatedGpuIds.slice(0, effectiveRequiredGpuCount)
         : validatedGpuIds.slice(0, 1)
 
     return { valid: true, gpuIds: effectiveGpuIds }
@@ -152,11 +151,11 @@ export class GpuSelector {
    */
   async getTargetGpus(
     gpuIds?: number[],
-    tensorParallelSize: number = 1
+    requiredGpuCount: number = 1
   ): Promise<{ gpuIds: number[]; wasAutoSelected: boolean }> {
     if (gpuIds && gpuIds.length > 0) {
       // Manual selection: validate
-      const validation = await this.validateGpuSelection(gpuIds, tensorParallelSize)
+      const validation = await this.validateGpuSelection(gpuIds, requiredGpuCount)
       if (!validation.valid) {
         throw new Error(validation.error!)
       }
@@ -164,17 +163,17 @@ export class GpuSelector {
     }
 
     // Auto-select: get recommendation
-    const recommendation = await this.getRecommendedGpu(tensorParallelSize)
+    const recommendation = await this.getRecommendedGpu(requiredGpuCount)
 
-    if (tensorParallelSize > 1) {
-      // For tensor parallel, return contiguous GPUs starting from recommended
+    if (requiredGpuCount > 1) {
+      // For multi-GPU execution, return contiguous GPUs starting from recommended
       const gpuIdArray = Array.from(
-        { length: tensorParallelSize },
+        { length: requiredGpuCount },
         (_, i) => recommendation.gpu_id + i
       )
       this.logger.info(
-        { gpuIds: gpuIdArray, tensorParallelSize, reason: recommendation.reason },
-        'Auto-selected GPUs for tensor parallel model'
+        { gpuIds: gpuIdArray, requiredGpuCount, reason: recommendation.reason },
+        'Auto-selected GPUs for multi-GPU model'
       )
       return { gpuIds: gpuIdArray, wasAutoSelected: true }
     }

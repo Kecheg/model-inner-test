@@ -36,3 +36,21 @@ class WeightSharingConfig:
     """secondary 等待 primary 写入注册表的最大时间（秒）。
     超时后 secondary 启动失败并报错。
     """
+
+    share_embedding: bool = False
+    """是否共享 token embedding / word embedding 参数。"""
+
+    share_lm_head: bool = False
+    """是否共享 lm_head / 输出头参数。"""
+
+    share_norm: bool = False
+    """是否共享最终 norm 参数。"""
+
+    share_vision_encoder: bool = False
+    """是否共享 vision encoder / visual backbone 参数。"""
+
+    share_projector: bool = False
+    """是否共享多模态 projector / connector 参数。"""
+
+    share_pooler: bool = False
+    """是否共享 pooler / classifier / score head 参数。"""
