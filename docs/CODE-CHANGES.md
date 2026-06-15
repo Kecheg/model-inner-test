@@ -1,6 +1,10 @@
 # fxp weight-share Overlay 代码变更清单
 
-对比基准：vLLM v0.18.0 (`docker.1ms.run/vllm/vllm-openai:v0.18.0`)
+> **2026-06 更新**：本清单原基于 v0.18.0。已迁移到 **v0.22.1**，canonical 树为
+> `vllm-0.22.1/`，本清单仍准确（hook 点结构在两版相同）。迁移细节见
+> `docs/MIGRATION-0.22.1.md`。下面"不包含在内的"补全了之前漏记的 4 个文件。
+
+对比基准：vLLM v0.22.1 (`docker.1ms.run/vllm/vllm-openai:v0.22.1`)
 排除：kvcached 独立包
 
 ---
@@ -111,6 +115,25 @@ if ws_config and ws_config.mode == "primary":
     wsm.export_weights(self.model)   # 导出所有 shareable 参数的 IPC handle
     logger.info("PRIMARY - exported IPC handles.")
 ```
+Secondary 分支：跳过 `prepare_communication_buffer_for_model`（FP8 MoE 模块化 kernel
+路径不兼容 legacy prepare）。
+
+### 14. `vllm/v1/worker/gpu_worker.py`（之前清单遗漏）
+- 模块级新增 3 个 helper：`requires_distributed_context`、`init_device_context`、
+  `init_distributed_context`（被 `weight_exporter.py` / `export_multi_weights.py` 复用）。
+- `init_device` 中：secondary 在分布式初始化前 `WeightSharingManager.pre_open_handles()`，
+  确保 CUDA IPC handle 在正确的设备上下文下打开。
+- 内存快照断言：secondary 模式放宽（IPC 权重不计入本地分配）。
+
+### 15. `vllm/entrypoints/cli/main.py`（之前清单遗漏）
+`CMD_MODULES` 注册两个 export 子命令：`export-weights`、`export-multi-weights`。
+
+### 16. `vllm/entrypoints/cli/export_multi_weights.py`（之前清单遗漏，新增文件）
+`vllm export-multi-weights` CLI 子命令：一次初始化分布式 + 循环加载多个模型并各自
+`export_weights`，避免多次启停 NCCL 的开销。
+
+### 17. `vllm/model_executor/model_loader/utils.py`（v0.22.1 无需改动）
+> 旧 overlay 仅删了一段注释，无语义变化；迁移到 0.22.1 时已跳过。
 
 ---
 

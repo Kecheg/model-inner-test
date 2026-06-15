@@ -7,6 +7,7 @@ vLLM-specific patches using unified patch infrastructure.
 
 from __future__ import annotations
 
+import inspect
 import os
 import threading
 import time
@@ -1399,16 +1400,53 @@ class GPUModelRunnerPatch(VersionAwarePatch, BasePatch):
 
         original_method = getattr(GPUModelRunner, "_reshape_kv_cache_tensors")
 
-        def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors, *args: Any, **kwargs: Any):
-            if (
-                enable_kvcached()
-                and not getattr(self, "is_pooling_model", False)
-                and not _should_bypass_kvcached_for_kv_config(kv_cache_config)
-            ):
-                return self._reshape_kv_cache_tensors_from_kvcached(
-                    kv_cache_config, kv_cache_raw_tensors, *args, **kwargs
+        # Signature drifted across vLLM versions:
+        #   <= 0.21.x : _reshape_kv_cache_tensors(self, kv_cache_config,
+        #                                          kv_cache_raw_tensors, ...)
+        #   >= 0.22.x : _reshape_kv_cache_tensors(self, kv_cache_raw_tensors,
+        #                                          kernel_block_sizes)
+        # The newer signature dropped the leading ``kv_cache_config`` argument;
+        # the config is now read from ``self.kv_cache_config``.  Detect the
+        # shape via introspection so we stay version-agnostic.
+        try:
+            _first_param = list(
+                inspect.signature(original_method).parameters
+            )[1]
+        except (ValueError, IndexError):
+            _first_param = "kv_cache_config"
+        _takes_config = _first_param == "kv_cache_config"
+
+        if _takes_config:
+            def _patched_reshape_kv(self, kv_cache_config, kv_cache_raw_tensors,
+                                    *args: Any, **kwargs: Any):
+                if (
+                    enable_kvcached()
+                    and not getattr(self, "is_pooling_model", False)
+                    and not _should_bypass_kvcached_for_kv_config(kv_cache_config)
+                ):
+                    return self._reshape_kv_cache_tensors_from_kvcached(
+                        kv_cache_config, kv_cache_raw_tensors, *args, **kwargs
+                    )
+                return original_method(
+                    self, kv_cache_config, kv_cache_raw_tensors, *args, **kwargs
                 )
-            return original_method(self, kv_cache_config, kv_cache_raw_tensors, *args, **kwargs)
+        else:
+            # vLLM >= 0.22: no kv_cache_config argument; read it from self.
+            def _patched_reshape_kv(self, kv_cache_raw_tensors,
+                                    *args: Any, **kwargs: Any):
+                kv_cache_config = getattr(self, "kv_cache_config", None)
+                if (
+                    enable_kvcached()
+                    and not getattr(self, "is_pooling_model", False)
+                    and kv_cache_config is not None
+                    and not _should_bypass_kvcached_for_kv_config(kv_cache_config)
+                ):
+                    return self._reshape_kv_cache_tensors_from_kvcached(
+                        kv_cache_config, kv_cache_raw_tensors, *args, **kwargs
+                    )
+                return original_method(
+                    self, kv_cache_raw_tensors, *args, **kwargs
+                )
 
         # NOTE: always overwrite — older kvcached versions may have already
         # patched this method without the pooling-model guard.

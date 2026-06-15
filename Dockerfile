@@ -1,4 +1,4 @@
-FROM vllm/vllm-openai:v0.18.0
+FROM docker.1ms.run/vllm/vllm-openai:v0.22.1
 
 ENV OPENBLAS_NUM_THREADS=1 \
     OMP_NUM_THREADS=1 \
@@ -18,20 +18,21 @@ USER root
 COPY node-v22.16.0-linux-x64/ /usr/local/
 COPY cuda-stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so
 
-COPY vllm/config/weight_sharing.py /tmp/ws/config/weight_sharing.py
-COPY vllm/config/vllm.py /tmp/ws/config/vllm.py
-COPY vllm/config/__init__.py /tmp/ws/config/__init__.py
-COPY vllm/engine/arg_utils.py /tmp/ws/engine/arg_utils.py
-COPY vllm/distributed/weight_sharing/ /tmp/ws/distributed/weight_sharing/
-COPY vllm/model_executor/model_loader/base_loader.py /tmp/ws/model_executor/model_loader/base_loader.py
-COPY vllm/model_executor/model_loader/default_loader.py /tmp/ws/model_executor/model_loader/default_loader.py
-COPY vllm/model_executor/model_loader/utils.py /tmp/ws/model_executor/model_loader/utils.py
-COPY vllm/v1/worker/gpu_model_runner.py /tmp/ws/v1/worker/gpu_model_runner.py
-COPY vllm/v1/worker/gpu_worker.py /tmp/ws/v1/worker/gpu_worker.py
-COPY vllm/entrypoints/cli/main.py /tmp/ws/entrypoints/cli/main.py
-COPY vllm/entrypoints/cli/export_multi_weights.py /tmp/ws/entrypoints/cli/export_multi_weights.py
-COPY vllm/entrypoints/cli/export_weights.py /tmp/ws/entrypoints/cli/export_weights.py
-COPY vllm/weight_exporter.py /tmp/ws/weight_exporter.py
+# overlay 源已切换到 vllm-0.22.1/（基于 vLLM 0.22.1 套用的 weight-sharing 改动）
+# 注意：model_loader/utils.py 在 0.22.1 无需改动，已从清单移除。
+COPY vllm-0.22.1/vllm/config/weight_sharing.py /tmp/ws/config/weight_sharing.py
+COPY vllm-0.22.1/vllm/config/vllm.py /tmp/ws/config/vllm.py
+COPY vllm-0.22.1/vllm/config/__init__.py /tmp/ws/config/__init__.py
+COPY vllm-0.22.1/vllm/engine/arg_utils.py /tmp/ws/engine/arg_utils.py
+COPY vllm-0.22.1/vllm/distributed/weight_sharing/ /tmp/ws/distributed/weight_sharing/
+COPY vllm-0.22.1/vllm/model_executor/model_loader/base_loader.py /tmp/ws/model_executor/model_loader/base_loader.py
+COPY vllm-0.22.1/vllm/model_executor/model_loader/default_loader.py /tmp/ws/model_executor/model_loader/default_loader.py
+COPY vllm-0.22.1/vllm/v1/worker/gpu_model_runner.py /tmp/ws/v1/worker/gpu_model_runner.py
+COPY vllm-0.22.1/vllm/v1/worker/gpu_worker.py /tmp/ws/v1/worker/gpu_worker.py
+COPY vllm-0.22.1/vllm/entrypoints/cli/main.py /tmp/ws/entrypoints/cli/main.py
+COPY vllm-0.22.1/vllm/entrypoints/cli/export_multi_weights.py /tmp/ws/entrypoints/cli/export_multi_weights.py
+COPY vllm-0.22.1/vllm/entrypoints/cli/export_weights.py /tmp/ws/entrypoints/cli/export_weights.py
+COPY vllm-0.22.1/vllm/weight_exporter.py /tmp/ws/weight_exporter.py
 COPY kvcached/ /opt/kvcached/
 
 RUN SITE=$(python3 -c "import vllm,os;print(os.path.dirname(vllm.__file__))") \
@@ -42,7 +43,6 @@ RUN SITE=$(python3 -c "import vllm,os;print(os.path.dirname(vllm.__file__))") \
     && cp /tmp/ws/engine/arg_utils.py "$SITE/engine/arg_utils.py" \
     && cp /tmp/ws/model_executor/model_loader/base_loader.py "$SITE/model_executor/model_loader/base_loader.py" \
     && cp /tmp/ws/model_executor/model_loader/default_loader.py "$SITE/model_executor/model_loader/default_loader.py" \
-    && cp /tmp/ws/model_executor/model_loader/utils.py "$SITE/model_executor/model_loader/utils.py" \
     && cp /tmp/ws/v1/worker/gpu_model_runner.py "$SITE/v1/worker/gpu_model_runner.py" \
     && cp /tmp/ws/v1/worker/gpu_worker.py "$SITE/v1/worker/gpu_worker.py" \
     && cp /tmp/ws/distributed/weight_sharing/*.py "$SITE/distributed/weight_sharing/" \
@@ -54,12 +54,25 @@ RUN SITE=$(python3 -c "import vllm,os;print(os.path.dirname(vllm.__file__))") \
     && python3 -m pip install --progress-bar off --no-cache-dir "wrapt>=1.15" "posix_ipc>=1.0" \
     && python3 -c "from pathlib import Path; p=Path('/opt/kvcached/setup.py'); s=p.read_text(); s=s.replace('{\"build_ext\": BuildExtension}', '{\"build_ext\": BuildExtension.with_options(use_ninja=False)}'); p.write_text(s)" \
     && LIBRARY_PATH=/usr/local/cuda/lib64/stubs USE_NINJA=0 MAX_JOBS=1 CUDA_HOME=/usr/local/cuda python3 -m pip install --progress-bar off --no-cache-dir --no-deps --no-build-isolation --force-reinstall /opt/kvcached \
+    && KVC=$(python3 -c "import kvcached,os;print(os.path.dirname(kvcached.__file__))") \
     && python3 -m py_compile \
+        "$SITE/config/__init__.py" \
+        "$SITE/config/vllm.py" \
+        "$SITE/config/weight_sharing.py" \
+        "$SITE/engine/arg_utils.py" \
         "$SITE/distributed/weight_sharing/manager.py" \
         "$SITE/distributed/weight_sharing/parameter_filter.py" \
+        "$SITE/distributed/weight_sharing/registry.py" \
+        "$SITE/model_executor/model_loader/base_loader.py" \
+        "$SITE/model_executor/model_loader/default_loader.py" \
+        "$SITE/v1/worker/gpu_model_runner.py" \
         "$SITE/v1/worker/gpu_worker.py" \
-        /usr/local/lib/python3.12/dist-packages/kvcached/kv_cache_manager.py \
-        /usr/local/lib/python3.12/dist-packages/kvcached/integration/vllm/patches.py \
+        "$SITE/entrypoints/cli/main.py" \
+        "$SITE/entrypoints/cli/export_weights.py" \
+        "$SITE/entrypoints/cli/export_multi_weights.py" \
+        "$SITE/weight_exporter.py" \
+        "$KVC/kv_cache_manager.py" \
+        "$KVC/integration/vllm/patches.py" \
     && python3 -c "from vllm.distributed.weight_sharing.parameter_filter import is_shareable_parameter; from vllm.config.weight_sharing import WeightSharingConfig; assert is_shareable_parameter('model.layers.0.qkv.weight') is True; assert is_shareable_parameter('model.embed_tokens.weight') is False; print('Weight sharing verified OK')"
 
 # Sardeenz must be pre-built in the build context because this environment's
