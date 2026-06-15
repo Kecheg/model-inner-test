@@ -5117,6 +5117,21 @@ class GPUModelRunner(
                     eplb_models += 1
 
                 time_after_load = time.perf_counter()
+
+                # Cross-process weight sharing:
+                #   Primary:  export IPC handles after model is loaded
+                #   Secondary: import already done inside the model loader
+                #              (DefaultModelLoader.post_load_weights).
+                ws_config = self.vllm_config.weight_sharing_config
+                if ws_config is not None and ws_config.mode == "primary":
+                    from vllm.distributed.weight_sharing import (
+                        WeightSharingManager,
+                    )
+                    self._weight_sharing_manager = WeightSharingManager(
+                        ws_config)
+                    self._weight_sharing_manager.export_weights(self.model)
+                    logger.info(
+                        "WeightSharing: PRIMARY - exported IPC handles.")
             self.model_memory_usage = m.consumed_memory
         except torch.cuda.OutOfMemoryError as e:
             msg = (
@@ -5134,12 +5149,31 @@ class GPUModelRunner(
             format_gib(self.model_memory_usage),
             time_after_load - time_before_load,
         )
+        ws_config = self.vllm_config.weight_sharing_config
+        is_weight_sharing_secondary = (
+            ws_config is not None and ws_config.mode == "secondary"
+        )
         if not load_dummy_weights:
-            prepare_communication_buffer_for_model(self.model)
+            if is_weight_sharing_secondary:
+                logger.info(
+                    "WeightSharing: SECONDARY - skipping post-load "
+                    "communication buffer preparation. The secondary imports "
+                    "already-processed IPC weights, and FP8 MoE modular kernel "
+                    "setup can otherwise re-enter an incompatible legacy "
+                    "prepare path."
+                )
+            else:
+                prepare_communication_buffer_for_model(self.model)
             if (drafter := getattr(self, "drafter", None)) and (
                 drafter_model := getattr(drafter, "model", None)
             ):
-                prepare_communication_buffer_for_model(drafter_model)
+                if is_weight_sharing_secondary:
+                    logger.info(
+                        "WeightSharing: SECONDARY - skipping drafter "
+                        "communication buffer preparation."
+                    )
+                else:
+                    prepare_communication_buffer_for_model(drafter_model)
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())

@@ -57,6 +57,7 @@ from vllm.config.vllm import (
     set_current_vllm_config,
 )
 from vllm.config.weight_transfer import WeightTransferConfig
+from vllm.config.weight_sharing import WeightSharingConfig
 
 # __all__ should only contain classes and functions.
 # Types and globals should be imported from their respective modules.
@@ -134,4 +135,5 @@ __all__ = [
     "set_current_vllm_config",
     "get_layers_from_vllm_config",
     "WeightTransferConfig",
+    "WeightSharingConfig",
 ]

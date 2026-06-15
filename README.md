@@ -1,7 +1,12 @@
 # vLLM Weight Sharing — fxp Overlay
 
-在 vLLM v0.18.0 上实现跨进程 GPU 权重共享。两个 vLLM 实例共享 decoder 层权重，
-secondary 只加载非共享参数（embed/head/norm），节省显存。
+在 vLLM **v0.22.1**（基础镜像 `docker.1ms.run/vllm/vllm-openai:v0.22.1`）上
+实现跨进程 GPU 权重共享。两个 vLLM 实例共享 decoder 层权重，secondary 只加载
+非共享参数（embed/head/norm），节省显存。
+
+> **历史**：原始 overlay 基于 vLLM 0.18.0（仍保留在 `vllm/` 目录作 diff 参照）；
+> 2026-06 已迁移到 0.22.1，canonical 树为 `vllm-0.22.1/`。详见
+> `docs/MIGRATION-0.22.1.md`（含完整端到端冒烟测试报告）。
 
 ## 目录结构
 
@@ -12,14 +17,17 @@ model-inner-test/
 ├── docs/
 │   ├── DEPLOY-GUIDE.md                 # 部署指南（单卡 + PP=4）
 │   ├── CODE-CHANGES.md                 # 代码变更清单（vs 原生 vLLM）
+│   ├── MIGRATION-0.22.1.md             # 0.18→0.22.1 迁移记录 + 验证报告
 │   └── BENCHMARK-RESULTS.md            # 性能测试结果
 ├── scripts/
 │   ├── start-primary-1gpu.sh           # 单卡 Primary 启动
 │   ├── start-secondary-1gpu.sh         # 单卡 Secondary 启动（参数：端口 显存利用率）
 │   ├── start-primary-pp4.sh            # PP=4 Primary 启动
 │   └── start-secondary-pp4.sh          # PP=4 Secondary 启动
-├── vllm/                               # fxp 修改的源码（覆盖到 site-packages）
-├── kvcached/                           # kvcached 完整源码，用于构建/安装 KV pool 能力
+├── tests/                              # 端到端冒烟测试（00 env→ 05 sardeenz e2e）
+├── vllm-0.22.1/                        # canonical 树（0.22.1 + weight-sharing overlay）
+├── vllm/                               # 旧 overlay（0.18，保留作 diff 参照）
+├── kvcached/                           # kvcached 完整源码（含 0.22.1 适配修复）
 └── sardeenz/                           # Sardeenz 完整源码，用于服务启动和调度
 ```
 
@@ -29,7 +37,7 @@ model-inner-test/
 
 ```bash
 cd model-inner-test
-docker build -t vllm-weight-share:v0.18.0 -f Dockerfile .
+docker build -t vllm-weight-share:v0.22.1 -f Dockerfile .
 ```
 
 ### 2. 部署（以单卡为例）

@@ -69,6 +69,59 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+
+def requires_distributed_context(vllm_config: VllmConfig) -> bool:
+    parallel_config = vllm_config.parallel_config
+    return any(
+        (
+            parallel_config.tensor_parallel_size > 1,
+            parallel_config.pipeline_parallel_size > 1,
+            parallel_config.data_parallel_size > 1,
+            parallel_config.prefill_context_parallel_size > 1,
+            parallel_config.decode_context_parallel_size > 1,
+            parallel_config.enable_expert_parallel,
+            parallel_config.enable_eplb,
+            parallel_config.enable_elastic_ep,
+        )
+    )
+
+
+def init_device_context(
+    vllm_config: VllmConfig,
+    local_rank: int,
+) -> torch.device:
+    device_config = vllm_config.device_config
+    if device_config.device_type != "cuda":
+        raise RuntimeError(f"Not support device type: {device_config.device}")
+
+    device = torch.device(f"cuda:{local_rank}")
+    ws_config = getattr(vllm_config, "weight_sharing_config", None)
+    if ws_config is not None and ws_config.mode == "primary":
+        os.environ.setdefault(
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "roundup_power2_divisions:16",
+        )
+    torch.accelerator.set_device_index(device)
+    current_platform.check_if_supports_dtype(vllm_config.model_config.dtype)
+    set_random_seed(vllm_config.model_config.seed)
+    return device
+
+
+def init_distributed_context(
+    vllm_config: VllmConfig,
+    rank: int,
+    local_rank: int,
+    distributed_init_method: str,
+) -> None:
+    init_worker_distributed_environment(
+        vllm_config,
+        rank,
+        distributed_init_method,
+        local_rank,
+        current_platform.dist_backend,
+    )
+
+
 if TYPE_CHECKING:
     from vllm.model_executor.model_loader.tensorizer import TensorizerConfig
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -269,9 +322,29 @@ class Worker(WorkerBase):
                 )
 
             self.device = torch.device(f"cuda:{self.local_rank}")
+            # Bind this worker to its local CUDA device before pre-opening
+            # weight-sharing IPC handles.  TP/PP secondary ranks must open
+            # handles with the context for their own local device; otherwise
+            # cudaIpcOpenMemHandle can see a default cuda:0 context and fail
+            # with cudaErrorInvalidDeviceContext.
             torch.accelerator.set_device_index(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
+
+            # Weight Sharing: pre-open CUDA IPC handles before distributed
+            # initialization and before heavier CUDA allocations.
+            ws_config = self.vllm_config.weight_sharing_config
+            if ws_config is not None and ws_config.mode == "secondary":
+                from vllm.distributed.weight_sharing import WeightSharingManager
+                # 从 rank 和 parallel_config 推导正确的 TP/PP rank
+                # （此时分布式环境尚未初始化，无法用 get_pp_group()）
+                tp_size = self.parallel_config.tensor_parallel_size
+                pp_size = self.parallel_config.pipeline_parallel_size
+                tp_rank = self.rank % tp_size
+                pp_rank = (self.rank // tp_size) % pp_size
+                wsm = WeightSharingManager(
+                    ws_config, tp_rank=tp_rank, pp_rank=pp_rank)
+                wsm.pre_open_handles(device_index=self.local_rank)
 
             # Initialize the distributed environment BEFORE taking
             # memory snapshot
@@ -435,15 +508,27 @@ class Worker(WorkerBase):
         free_gpu_memory = profile_result.after_profile.free_memory
         # NOTE(woosuk): Here we assume that the other processes using the same
         # GPU did not change their memory usage during the profiling.
-        assert self.init_snapshot.free_memory >= free_gpu_memory, (
-            "Error in memory profiling. "
-            f"Initial free memory {format_gib(self.init_snapshot.free_memory)} GiB, "
-            f"current free memory {format_gib(free_gpu_memory)} GiB. "
-            "This happens when other processes sharing the same container "
-            "release GPU memory while vLLM is profiling during initialization. "
-            "To fix this, ensure consistent GPU memory allocation or "
-            "isolate vLLM in its own container."
+        # Exception: in weight-sharing secondary mode, IPC-imported tensors are
+        # not locally allocated, so shareable-param placeholders are freed
+        # during loading, which can legitimately increase free_gpu_memory.
+        _ws_config = self.vllm_config.weight_sharing_config
+        _is_ws_secondary = (
+            _ws_config is not None and _ws_config.mode == "secondary"
         )
+        if not _is_ws_secondary:
+            assert self.init_snapshot.free_memory >= free_gpu_memory, (
+                "Error in memory profiling. "
+                f"Initial free memory {format_gib(self.init_snapshot.free_memory)} GiB, "
+                f"current free memory {format_gib(free_gpu_memory)} GiB. "
+                "This happens when other processes sharing the same container "
+                "release GPU memory while vLLM is profiling during initialization. "
+                "To fix this, ensure consistent GPU memory allocation or "
+                "isolate vLLM in its own container."
+            )
+        else:
+            # In secondary mode, memory baseline is the actual post-profile
+            # free memory (IPC weights don't consume local GPU allocation).
+            free_gpu_memory = min(free_gpu_memory, self.init_snapshot.free_memory)
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory

@@ -51,6 +51,7 @@ from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
 from .weight_transfer import WeightTransferConfig
+from .weight_sharing import WeightSharingConfig
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -365,6 +366,9 @@ class VllmConfig:
 
     weight_transfer_config: WeightTransferConfig | None = None
     """The configurations for weight transfer during RL training."""
+
+    weight_sharing_config: WeightSharingConfig | None = None
+    """The configurations for cross-process model weight sharing."""
 
     shutdown_timeout: int = Field(default=0, ge=0)
     """Shutdown grace period for in-flight requests. Shutdown will be delayed for

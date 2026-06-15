@@ -50,8 +50,20 @@ class BaseModelLoader(ABC):
             device_config.device if load_config.device is None else load_config.device
         )
         target_device = torch.device(load_device)
+
+        # ── 权重共享：secondary 用 CPU 初始化，消除 ~5GB CUDA 峰值 ──
+        # secondary 在 CPU 上调用 initialize_model()（0 GPU 分配），
+        # 之后 default_loader 会将非共享参数搬到 CUDA，共享参数用 CPU 占位符代替。
+        # 共享参数最终通过 CUDA IPC import 以零 GPU 成本填充。
+        ws_config = vllm_config.weight_sharing_config
+        init_device = (
+            torch.device("cpu")
+            if ws_config is not None and ws_config.mode == "secondary"
+            else target_device
+        )
+
         with set_default_torch_dtype(model_config.dtype):
-            with target_device:
+            with init_device:
                 model = initialize_model(
                     vllm_config=vllm_config,
                     model_config=model_config,
@@ -78,6 +90,14 @@ class BaseModelLoader(ABC):
                 finalize_layerwise_processing(model, model_config)
 
             process_weights_after_loading(model, model_config, target_device)
+
+        # After all processing (quantization, etc.), fill in IPC-backed
+        # shareable parameters.  This must run *after*
+        # process_weights_after_loading so that imported tensors
+        # (already processed by the primary) are not re-processed.
+        post_load = getattr(self, "post_load_weights", None)
+        if post_load is not None:
+            post_load(model, vllm_config)
 
         return model.eval()
 

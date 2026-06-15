@@ -61,6 +61,7 @@ from vllm.config import (
     UVAOffloadConfig,
     VllmConfig,
     WeightTransferConfig,
+    WeightSharingConfig,
     get_attr_docs,
 )
 from vllm.config.cache import (
@@ -711,6 +712,11 @@ class EngineArgs:
         "weight_transfer_config",
     )
 
+    weight_sharing_config: WeightSharingConfig | None = get_field(
+        VllmConfig,
+        "weight_sharing_config",
+    )
+
     fail_on_environ_validation: bool = False
     gdn_prefill_backend: Literal["flashinfer", "triton", "cutedsl"] | None = None
 
@@ -731,6 +737,10 @@ class EngineArgs:
         if isinstance(self.weight_transfer_config, dict):
             self.weight_transfer_config = WeightTransferConfig(
                 **self.weight_transfer_config
+            )
+        if isinstance(self.weight_sharing_config, dict):
+            self.weight_sharing_config = WeightSharingConfig(
+                **self.weight_sharing_config
             )
         if isinstance(self.ir_op_priority, dict):
             self.ir_op_priority = IrOpPriorityConfig(**self.ir_op_priority)
@@ -1494,6 +1504,9 @@ class EngineArgs:
         vllm_group.add_argument(
             "--weight-transfer-config", **vllm_kwargs["weight_transfer_config"]
         )
+        vllm_group.add_argument(
+            "--weight-sharing-config", **vllm_kwargs["weight_sharing_config"]
+        )
 
         # Other arguments
         parser.add_argument(
@@ -2246,6 +2259,7 @@ class EngineArgs:
             optimization_level=self.optimization_level,
             performance_mode=self.performance_mode,
             weight_transfer_config=self.weight_transfer_config,
+            weight_sharing_config=self.weight_sharing_config,
             shutdown_timeout=self.shutdown_timeout,
         )
 

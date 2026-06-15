@@ -11,9 +11,10 @@ import torch
 from torch import nn
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
-from vllm.config import ModelConfig
+from vllm.config import ModelConfig, VllmConfig
 from vllm.config.load import LoadConfig
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.model_executor.layers.quantization.torchao import torchao_version_at_least
 from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.ep_weight_filter import (
@@ -391,6 +392,25 @@ class DefaultModelLoader(BaseModelLoader):
 
         self._init_ep_weight_filter(model_config)
 
+        # ── Weight sharing (secondary) ──
+        # Before loading the checkpoint, shrink shareable params to 1-element
+        # CPU placeholders and no-op their weight_loader / quant postprocess.
+        # The real (already-processed) weights arrive later via CUDA IPC in
+        # post_load_weights.  Non-shareable params are moved to CUDA so the
+        # normal load path works unchanged.
+        shareable_names = _get_phase2_shareable_names(model)
+        if shareable_names:
+            _shrink_shareable_params(model, shareable_names)
+            # Patch weight_loader on each shrunken param so that any
+            # load attempt (including fused/stacked variants) is a no-op.
+            _patch_shareable_weight_loaders(model, shareable_names)
+            # Replace fp8 Marlin repack on shareable quantized modules
+            # with a no-op that only allocates workspace.  The primary
+            # already repacked these weights; the secondary receives the
+            # final form via IPC.  This prevents an assertion failure on
+            # the 1-element placeholder shape.
+            _patch_shareable_quant_postprocess(model, shareable_names)
+
         loaded_weights = model.load_weights(self.get_all_weights(model_config, model))
 
         self.counter_after_loading_weights = time.perf_counter()
@@ -430,8 +450,230 @@ class DefaultModelLoader(BaseModelLoader):
                         full_name = f"{name}.{param_name}" if name else param_name
                         loaded_weights.add(full_name)
             weights_not_loaded = weights_to_load - loaded_weights
+            # Allow skipping shareable params for weight sharing — they are
+            # filled later via CUDA IPC, not from the checkpoint.
+            weights_not_loaded -= _get_phase2_shareable_names(model)
             if weights_not_loaded:
                 raise ValueError(
                     "Following weights were not initialized from "
                     f"checkpoint: {weights_not_loaded}"
                 )
+
+    @instrument(span_name="Import shared weights from IPC")
+    def post_load_weights(self, model: nn.Module,
+                          vllm_config: VllmConfig) -> None:
+        """Fill shareable parameters from CUDA IPC handles.
+
+        Called after process_weights_after_loading inside
+        BaseModelLoader.load_model.  The primary already processed
+        (quantised, repacked) the shareable weights; we import them
+        directly via IPC.
+        """
+        ws_config = vllm_config.weight_sharing_config
+        if ws_config is None or ws_config.mode != "secondary":
+            return
+        from vllm.distributed.weight_sharing import WeightSharingManager
+        wsm = WeightSharingManager(ws_config)
+        imported = wsm.import_weights(model)
+        logger.info(
+            "WeightSharing: IPC-imported %d shareable params.", len(imported))
+        # After import, every shareable quantized layer now has correctly
+        # shaped weights on CUDA.  Ensure Marlin workspace is allocated.
+        _ensure_workspace(model)
+        _ensure_weight_sharing_secondary_moe_kernels(model)
+
+
+def _get_phase2_shareable_names(model) -> set[str]:
+    """Return shareable parameter names for secondary weight-sharing."""
+    try:
+        from vllm.config import get_current_vllm_config
+        ws = get_current_vllm_config().weight_sharing_config
+    except Exception:
+        return set()
+    if ws is None or ws.mode != "secondary":
+        return set()
+    from vllm.distributed.weight_sharing.parameter_filter import (
+        get_shareable_param_names,
+    )
+    return get_shareable_param_names(model, ws)
+
+
+def _shrink_shareable_params(model, shareable_names: set[str]) -> None:
+    """Move non-shareable params to CUDA and replace shareable with meta.
+
+    Called after CPU-based initialization of a secondary instance.
+    Non-shareable params (embed, head, norm) are moved to the CUDA device
+    so that load_weights and process_weights_after_loading work normally.
+    Shareable params are replaced with meta tensors (zero GPU memory).
+    After IPC import they will point directly to primary's GPU memory.
+    """
+    device = torch.device("cuda")
+    params = dict(model.named_parameters())
+    n_moved = 0
+    n_meta = 0
+    for name, param in params.items():
+        if name in shareable_names:
+            # Keep on CPU as 1-element placeholder — avoids vLLM's
+            # BasevLLMParameter.__torch_function__ type check that
+            # blocks meta device assignment.  The real IPC tensor
+            # will replace this during import_weights().
+            param.data = torch.empty(
+                1, dtype=param.data.dtype, device=torch.device("cpu"),
+            )
+            n_meta += 1
+        elif param.data.device.type == "cpu":
+            param.data = param.data.to(device)
+            n_moved += 1
+    logger.info(
+        "WeightSharing: CPU-init secondary — %d non-shareable params moved "
+        "to CUDA, %d shareable params set to meta (0 GPU).", n_moved, n_meta)
+    if current_platform.is_cuda():
+        logger.info(
+            "WeightSharing: GPU memory after init: %d MiB used / %d MiB total",
+            (torch.cuda.get_device_properties(0).total_memory
+             - torch.cuda.mem_get_info()[0]) // (1024**2),
+            torch.cuda.get_device_properties(0).total_memory // (1024**2))
+
+
+def _patch_shareable_weight_loaders(model, shareable_names: set[str]) -> None:
+    """Replace every shareable parameter's weight_loader with a no-op.
+
+    After shrinking, the 1-element placeholder cannot accept the
+    full checkpoint tensor.  Since the real weights will be filled
+    from IPC handles later, we silence the weight_loader entirely.
+    """
+    params = dict(model.named_parameters())
+    for name in shareable_names:
+        if name not in params:
+            continue
+        param = params[name]
+        # Save the original weight_loader for reference (not used now,
+        # but allows future undo).
+        if not hasattr(param, "_saved_weight_loader"):
+            param._saved_weight_loader = getattr(param, "weight_loader", None)
+        param.weight_loader = lambda *_, **__: None
+
+
+def _patch_shareable_quant_postprocess(model, shareable_names: set[str]) -> None:
+    """Patch quant_method.process_weights_after_loading for every module
+    that owns a shareable parameter (Phase 2 secondary).
+
+    vLLM's quantised linear layers (QKVParallelLinear etc.) do not expose
+    a ``.weight`` attribute, so we derive module paths from the parameter
+    names provided by the caller.
+
+    The primary already ran ``prepare_fp8_layer_for_marlin`` on these
+    layers; the secondary must not re-repack the CPU placeholder.
+    Instead, we replace the method with a stub that allocates workspace.
+    """
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_make_workspace_new,
+    )
+
+    # Derive module paths from parameter names:
+    module_paths: set[str] = set()
+    for name in shareable_names:
+        module_paths.add(name.rsplit(".", 1)[0])
+
+    for module_path, module in model.named_modules():
+        if module_path not in module_paths:
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is None or not hasattr(
+            quant_method, "process_weights_after_loading"
+        ):
+            continue
+
+        setattr(quant_method,
+                "_saved_process_weights_after_loading",
+                quant_method.process_weights_after_loading)
+
+        def _make_stub(mkw=marlin_make_workspace_new):
+            def _stub(layer: torch.nn.Module) -> None:
+                if not hasattr(layer, "input_scale"):
+                    layer.input_scale = None
+                if not hasattr(layer, "workspace"):
+                    cuda_dev = torch.device("cuda", torch.cuda.current_device())
+                    layer.workspace = mkw(cuda_dev, max_blocks_per_sm=4)
+            return _stub
+
+        quant_method.process_weights_after_loading = _make_stub()
+
+
+def _ensure_workspace(model) -> None:
+    """Allocate Marlin workspace for every quantised linear layer
+    that does not have one yet.  A safety net in case the
+    process_weights_after_loading stub missed a module."""
+    from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+        marlin_make_workspace_new,
+    )
+    cuda_dev = torch.device("cuda", torch.cuda.current_device())
+    for _, module in model.named_modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is not None and not hasattr(module, "input_scale"):
+            module.input_scale = None
+        if quant_method is not None and not hasattr(module, "workspace"):
+            module.workspace = marlin_make_workspace_new(cuda_dev, max_blocks_per_sm=4)
+
+
+def _ensure_weight_sharing_secondary_moe_kernels(model) -> None:
+    """Initialize FP8 MoE runtime kernels after IPC weight import.
+
+    Secondary weight-sharing instances import already-processed expert weights
+    from the primary.  Re-entering process_weights_after_loading would repack
+    those tensors again, while prepare_communication_buffer_for_model enters an
+    incompatible legacy MoE path.  Build only the runtime kernel object that
+    FP8 MoE forward expects.
+    """
+    from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+        make_fp8_moe_kernel,
+    )
+
+    initialized = 0
+    skipped = 0
+    for _, module in model.named_modules():
+        if module.__class__.__name__ not in ("FusedMoE", "SharedFusedMoE"):
+            continue
+
+        quant_method = getattr(module, "quant_method", None)
+        if (
+            quant_method is None
+            or getattr(quant_method, "moe_kernel", None) is not None
+        ):
+            continue
+        if not all(
+            hasattr(quant_method, attr)
+            for attr in ("get_fused_moe_quant_config", "moe", "fp8_backend")
+        ):
+            skipped += 1
+            continue
+
+        experts_cls = getattr(quant_method, "experts_cls", None)
+        if experts_cls is None:
+            skipped += 1
+            continue
+
+        moe_quant_config = quant_method.get_fused_moe_quant_config(module)
+        if moe_quant_config is None:
+            skipped += 1
+            continue
+
+        routing_tables = module._maybe_init_expert_routing_tables()
+        quant_method.moe_quant_config = moe_quant_config
+        quant_method.moe_kernel = make_fp8_moe_kernel(
+            moe_quant_config=moe_quant_config,
+            moe_config=quant_method.moe,
+            fp8_backend=quant_method.fp8_backend,
+            experts_cls=experts_cls,
+            routing_tables=routing_tables,
+            shared_experts=module.shared_experts,
+        )
+        initialized += 1
+
+    if initialized or skipped:
+        logger.info(
+            "WeightSharing: initialized %d secondary FP8 MoE kernels "
+            "after IPC import; skipped %d modules.",
+            initialized,
+            skipped,
+        )
